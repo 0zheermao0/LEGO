@@ -1,0 +1,38 @@
+program: main.py # Your Python script name
+method: bayes # Or random, grid
+metric:
+  name: eval/best_target_acc # The metric to optimize (use wandb.summary key)
+  goal: maximize # Or minimize
+parameters:
+  learning_rate:
+    distribution: log_uniform_values
+    min: 1e-4
+    max: 1e-2
+  weight_decay:
+    distribution: log_uniform_values
+    min: 1e-4
+    max: 1e-2
+  drop_out: # Even if unused in model, keep if defined in args/config
+    distribution: uniform
+    min: 0.1
+    max: 0.5
+  encoder_dim:
+    values: [256, 512, 1024]
+  # expert_num:
+  #   values: [2, 3, 4]
+  uncertainty_k:
+    distribution: int_uniform
+    min: 5
+    max: 10
+  gate_coef:
+    distribution: log_uniform_values
+    min: 1e-3
+    max: 5e-2
+  llm:
+    values: [qwen2.5:3b, qwen2.5:7b, qwen2.5:14b]
+  # Add other parameters from your script's argparse you want to tune
+  # Fixed parameters can be passed via command line in the agent command if needed
+  # source:
+  #   value: dblpv7 # Example fixed value
+  # target:
+  #   value: citationv1 # Example fixed value

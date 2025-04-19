@@ -120,15 +120,15 @@ class MoE(nn.Module):
         self.num_experts = num_experts
         self.k = k
         self.loss_coef = coef
-        
+
         # Default to single hop for all experts if not specified
         if num_hops is None:
             num_hops = [1] * num_experts
-            
+
         # Ensure num_hops length matches num_experts
         if len(num_hops) != num_experts:
             raise ValueError(f"Length of num_hops ({len(num_hops)}) must match num_experts ({num_experts})")
-        
+
         # Instantiate experts with potentially different configurations
         self.experts = nn.ModuleList([])
         for i in range(self.num_experts):
@@ -140,7 +140,7 @@ class MoE(nn.Module):
                 expert = PPMIConv(input_size, output_size)
             else:
                 raise ValueError(f"Unsupported GNN type: {gnn_type}")
-                
+
             # Wrap expert in a sequential if multi-hop is needed
             if num_hops[i] > 1:
                 layers = []
@@ -155,7 +155,7 @@ class MoE(nn.Module):
                     layers.append(nn.ReLU())
                 expert = nn.Sequential(*layers)
             self.experts.append(expert)
-            
+
         self.w_gate = nn.Parameter(torch.zeros(input_size, num_experts), requires_grad=True)
         self.w_noise = nn.Parameter(torch.zeros(input_size, num_experts), requires_grad=True)
         self.softplus = nn.Softplus()
@@ -249,8 +249,8 @@ class MoE(nn.Module):
         else:
             load = self._gates_to_load(gates)
         return gates, load # [batch_size, num_experts], [num_experts]
-    
-    def get_node_expert_assignment(self, x):
+
+    def get_node_expert_assignment(self, x, edge_index):
         """获取每个节点被分配到的专家信息
         Args:
             x: 输入特征 [num_nodes, input_size]
@@ -261,10 +261,10 @@ class MoE(nn.Module):
         with torch.no_grad():
             # 获取gates和load
             gates, _ = self.noisy_top_k_gating(x, train=False)
-            
+
             # 获取每个节点的top-k专家索引和对应的概率
             expert_probs, expert_indices = gates.topk(self.k, dim=1)
-            
+
         return expert_indices, expert_probs
 
     def get_expert_output(self, expert_idx, x, edge_index, edge_attr=None):
@@ -279,7 +279,7 @@ class MoE(nn.Module):
         """
         if not 0 <= expert_idx < self.num_experts:
             raise ValueError(f"Expert index {expert_idx} out of range [0, {self.num_experts-1}]")
-            
+
         expert = self.experts[expert_idx]
         if isinstance(expert, nn.Sequential):
             output = x
