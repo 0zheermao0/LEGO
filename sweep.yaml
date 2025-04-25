@@ -17,22 +17,24 @@ parameters:
     min: 0.1
     max: 0.5
   encoder_dim:
-    values: [256, 512, 1024]
+    values: [256, 512]
   # expert_num:
   #   values: [2, 3, 4]
   uncertainty_k:
     distribution: int_uniform
-    min: 5
-    max: 10
+    min: 20
+    max: 100
   gate_coef:
     distribution: log_uniform_values
     min: 1e-3
     max: 5e-2
   llm:
-    values: [qwen2.5:3b, qwen2.5:7b, qwen2.5:14b]
-  # Add other parameters from your script's argparse you want to tune
-  # Fixed parameters can be passed via command line in the agent command if needed
-  # source:
-  #   value: dblpv7 # Example fixed value
-  # target:
-  #   value: citationv1 # Example fixed value
+    values: [qwen2.5:3b, qwen2.5:7b]
+  select_weight:
+    distribution: uniform
+    min: 1
+    max: 10
+  semi_weight:
+    distribution: uniform
+    min: 0.5
+    max: 1

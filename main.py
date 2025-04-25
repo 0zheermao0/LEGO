@@ -35,7 +35,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 parser = argparse.ArgumentParser()
 # Keep argparse for arguments you might want to set outside of a sweep or as defaults
-parser.add_argument("--source", type=str, default='acmv9')
+parser.add_argument("--source", type=str, default='dblpv7')
 parser.add_argument("--target", type=str, default='citationv1')
 parser.add_argument("--seed", type=int, default=1)
 parser.add_argument("--learning_rate", type=float, default=5e-3)
@@ -47,6 +47,9 @@ parser.add_argument("--expert_num", type=int, default=3)
 parser.add_argument("--llm", type=str, default='qwen2.5:7b')
 parser.add_argument("--uncertainty_k", type=int, default=5)
 parser.add_argument("--gate_coef", type=float, default=1e-1)
+parser.add_argument("--select_weight", type=float, default=1)
+parser.add_argument("--semi_weight", type=float, default=1)
+parser.add_argument("--llm_interval", type=int, default=20, help="Interval of epochs to call LLM for expert selection")
 # --- W&B specific arguments (optional, can be set in wandb.init or sweep config) ---
 parser.add_argument("--wandb_project", type=str, default="GNN-Domain-Adaptation-Sweep")
 parser.add_argument("--wandb_entity", type=str, default=None, help="Your W&B username or team name") # Or set directly in wandb.init
@@ -105,39 +108,32 @@ label_mask = torch.tensor(label_mask).to(device)
 
 # --- Helper Functions (index2dense, GradReverse, GRL, encode, predict, evaluate) ---
 # (Keep these functions as they are, they don't need direct W&B integration)
-def index2dense(edge_index,nnode=2708):
-    indx = edge_index.cpu().detach().numpy()
-    adj = np.zeros((nnode,nnode),dtype = 'int8')
-    adj[(indx[0],indx[1])]=1
-    new_adj = torch.from_numpy(adj).float()
-    return new_adj
+# def index2dense(edge_index,nnode=2708):
+#     indx = edge_index.cpu().detach().numpy()
+#     adj = np.zeros((nnode,nnode),dtype = 'int8')
+#     adj[(indx[0],indx[1])]=1
+#     new_adj = torch.from_numpy(adj).float()
+#     return new_adj
 
-class GradReverse(torch.autograd.Function):
-    # Keep rate global or pass it properly if needed outside train()
-    rate = 0.0 # Initialize rate
-    @staticmethod
-    def forward(ctx, x):
-        return x.view_as(x)
-    @staticmethod
-    def backward(ctx, grad_output):
-        grad_output = grad_output.neg() * GradReverse.rate # Access rate correctly
-        return grad_output, None
-
-class GRL(nn.Module):
-    def forward(self, input):
-        return GradReverse.apply(input)
+def index2dense(edge_index, nnode=2708):
+    # edge_index: shape [2, num_edges]
+    device = edge_index.device
+    adj = torch.zeros((nnode, nnode), dtype=torch.float32, device=device)
+    adj[edge_index[0], edge_index[1]] = 1.0
+    return adj
 
 def encode(data, cache_name, mask=None):
     # Ensure 'encoder' is accessible (defined later, might need refactoring or pass as arg if needed earlier)
-    encoded_output, experts_outputs, gate_loss = encoder(data.x, data.edge_index, cache_name)
+    encoded_output, experts_outputs, gate_loss, clean_logits = encoder(data.x, data.edge_index, cache_name)
     if mask is not None:
         encoded_output = encoded_output[mask]
         experts_outputs = experts_outputs[mask]
-    return encoded_output, experts_outputs, gate_loss
+        clean_logits = clean_logits[mask]
+    return encoded_output, experts_outputs, gate_loss, clean_logits
 
 def predict(data, cache_name, mask=None):
     # Ensure 'cls_model' is accessible
-    encoded_output, _, _ = encode(data, cache_name, mask)
+    encoded_output, _, _, _ = encode(data, cache_name, mask)
     logits = cls_model(encoded_output)
     return logits
 
@@ -154,38 +150,34 @@ def evaluate(preds, labels):
 
 
 def test(data, cache_name, mask=None):
-    for model in models: # Ensure 'models' is accessible
-        model.eval()
-    # Use with torch.no_grad() for efficiency during evaluation
-    with torch.no_grad():
-        encoded_output, experts_outputs, _ = encode(data, cache_name, mask)
-        logits = predict(data, cache_name, mask) # predict already calls encode
-        preds = logits.argmax(dim=1)
-        labels = data.y if mask is None else data.y[mask]
-        accuracy, macro_f1, micro_f1 = evaluate(preds, labels)
+    encoded_output, experts_outputs, _, clean_logits = encode(data, cache_name, mask)
+    logits = predict(data, cache_name, mask) # predict already calls encode
+    preds = logits.argmax(dim=1)
+    labels = data.y if mask is None else data.y[mask]
+    accuracy, macro_f1, micro_f1 = evaluate(preds, labels)
 
-        # Log expert selection during testing for target data (Maybe log as artifact)
-        if cache_name == config.target: # Use config.target
-            moe_expert_indices, moe_expert_probs = encoder.get_node_expert_assignment(data.x, data.edge_index)
-            expert_selection_log_path = f"log/{config.target}-expert-selection.csv"
-            os.makedirs(os.path.dirname(expert_selection_log_path), exist_ok=True)
-            with open(expert_selection_log_path, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(['Node ID', 'Selected Expert', 'Probability'])
-                # Check if indices/probs are tensors and get dimensions safely
-                if isinstance(moe_expert_indices, torch.Tensor) and moe_expert_indices.ndim >= 1:
-                    num_nodes_sel = moe_expert_indices.shape[0]
-                    num_k_sel = moe_expert_indices.shape[1] if moe_expert_indices.ndim > 1 else 1
-                    for node_id in range(num_nodes_sel):
-                         for k in range(num_k_sel):
-                            expert_idx_tensor = moe_expert_indices[node_id, k] if moe_expert_indices.ndim > 1 else moe_expert_indices[node_id]
-                            expert_prob_tensor = moe_expert_probs[node_id, k] if moe_expert_probs.ndim > 1 else moe_expert_probs[node_id]
-                            writer.writerow([node_id, expert_idx_tensor.item(), expert_prob_tensor.item()])
-            # --- W&B Artifact Logging (Optional) ---
-            # Log the expert selection CSV as an artifact
-            artifact = wandb.Artifact(f'{config.target}_expert_selection', type='analysis_results')
-            artifact.add_file(expert_selection_log_path)
-            wandb.log_artifact(artifact)
+    # Log expert selection during testing for target data (Maybe log as artifact)
+    if cache_name == config.target: # Use config.target
+        moe_expert_indices, moe_expert_probs, _ = encoder.get_node_expert_assignment(data.x, data.edge_index)
+        expert_selection_log_path = f"log/{config.target}-expert-selection.csv"
+        os.makedirs(os.path.dirname(expert_selection_log_path), exist_ok=True)
+        with open(expert_selection_log_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Node ID', 'Selected Expert', 'Probability'])
+            # Check if indices/probs are tensors and get dimensions safely
+            if isinstance(moe_expert_indices, torch.Tensor) and moe_expert_indices.ndim >= 1:
+                num_nodes_sel = moe_expert_indices.shape[0]
+                num_k_sel = moe_expert_indices.shape[1] if moe_expert_indices.ndim > 1 else 1
+                for node_id in range(num_nodes_sel):
+                    for k in range(num_k_sel):
+                        expert_idx_tensor = moe_expert_indices[node_id, k] if moe_expert_indices.ndim > 1 else moe_expert_indices[node_id]
+                        expert_prob_tensor = moe_expert_probs[node_id, k] if moe_expert_probs.ndim > 1 else moe_expert_probs[node_id]
+                        writer.writerow([node_id, expert_idx_tensor.item(), expert_prob_tensor.item()])
+        # --- W&B Artifact Logging (Optional) ---
+        # Log the expert selection CSV as an artifact
+        # artifact = wandb.Artifact(f'{config.target}_expert_selection', type='analysis_results')
+        # artifact.add_file(expert_selection_log_path)
+        # wandb.log_artifact(artifact)
             # --- End W&B Artifact Logging ---
 
     return accuracy, macro_f1, micro_f1, encoded_output # Return output for saving embeddings
@@ -266,6 +258,13 @@ target_data.new_adj = index2dense(target_edge_index, target_data.num_nodes).to(d
 models = [encoder, cls_model]
 params = itertools.chain(*[model.parameters() for model in models])
 optimizer = torch.optim.Adam(params, lr=config.learning_rate, weight_decay=config.weight_decay)
+# optimizer_moe = torch.optim.Adam(encoder.gate_gnn.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+# print 哪些模块的参数被更新
+for name, param in encoder.named_parameters():
+    if param.requires_grad:
+        print(name, param.data)
+
+# optimizer = torch.optim.Adam(params, lr=config.learning_rate)
 
 # --- Remove Manual CSV Logging ---
 # The W&B logging replaces the need for manual hyperparameter and metric CSV logging.
@@ -285,9 +284,31 @@ def Entropy(input, weight, label):
     entropy_loss -= torch.sum(-msoftmax * torch.log(msoftmax + 1e-5))
     return entropy_loss
 
+# def calculate_expert_uncertainty(experts_outputs, num_classes, cls_model, uncertainty_k=5):
+#     # (Keep this function as is, but use config.uncertainty_k)
+#     import scipy.special # Keep import local if only used here
+#     num_nodes, num_experts, d_feature = experts_outputs.shape
+#     experts_logits = torch.zeros(num_nodes, num_experts, num_classes, device=experts_outputs.device)
+#     for i in range(num_experts):
+#         experts_logits[:, i, :] = cls_model(experts_outputs[:, i, :])
+#     experts_probs = torch.softmax(experts_logits, dim=-1)
+#     log_probs = torch.log(experts_probs + 1e-9)
+#     joint_log_probs = torch.logsumexp(log_probs, dim=1)
+#     total_confidence = torch.softmax(joint_log_probs, dim=-1)
+#     expected_ratios = joint_log_probs + torch.log(total_confidence + 1e-9)
+#     # Use numpy for logsumexp on CPU
+#     expected_ratios_np = scipy.special.logsumexp(expected_ratios.cpu().detach().numpy(), axis=-1)
+#     uncertainty = torch.from_numpy(expected_ratios_np).float().to(experts_outputs.device)
+#     k = min(uncertainty_k, uncertainty.size(0)) # Use uncertainty_k from args/config
+#     if k > 0:
+#         _, topk_indices = torch.topk(uncertainty, k, dim=0)
+#         uncertainty_mask = torch.zeros_like(uncertainty, dtype=torch.bool)
+#         uncertainty_mask[topk_indices] = True
+#     else:
+#         uncertainty_mask = torch.zeros_like(uncertainty, dtype=torch.bool)
+#     return uncertainty_mask
+
 def calculate_expert_uncertainty(experts_outputs, num_classes, cls_model, uncertainty_k=5):
-    # (Keep this function as is, but use config.uncertainty_k)
-    import scipy.special # Keep import local if only used here
     num_nodes, num_experts, d_feature = experts_outputs.shape
     experts_logits = torch.zeros(num_nodes, num_experts, num_classes, device=experts_outputs.device)
     for i in range(num_experts):
@@ -297,10 +318,9 @@ def calculate_expert_uncertainty(experts_outputs, num_classes, cls_model, uncert
     joint_log_probs = torch.logsumexp(log_probs, dim=1)
     total_confidence = torch.softmax(joint_log_probs, dim=-1)
     expected_ratios = joint_log_probs + torch.log(total_confidence + 1e-9)
-    # Use numpy for logsumexp on CPU
-    expected_ratios_np = scipy.special.logsumexp(expected_ratios.cpu().detach().numpy(), axis=-1)
-    uncertainty = torch.from_numpy(expected_ratios_np).float().to(experts_outputs.device)
-    k = min(uncertainty_k, uncertainty.size(0)) # Use uncertainty_k from args/config
+    # 纯 PyTorch 实现 logsumexp
+    uncertainty = torch.logsumexp(expected_ratios, dim=-1)
+    k = min(uncertainty_k, uncertainty.size(0))
     if k > 0:
         _, topk_indices = torch.topk(uncertainty, k, dim=0)
         uncertainty_mask = torch.zeros_like(uncertainty, dtype=torch.bool)
@@ -338,12 +358,12 @@ def get_max_hop_neighbors(edge_index, num_nodes, mask):
 def train(epoch):
     for model in models:
         model.train()
-    optimizer.zero_grad()
+    # optimizer.zero_grad()
 
     # Set rate for GradReverse (ensure this is the intended way to set it)
-    GradReverse.rate = min((epoch + 1) / epochs, 0.05)
+    # GradReverse.rate = min((epoch + 1) / epochs, 0.05)
 
-    encoded_source, experts_outputs, source_gate_loss = encode(source_data, config.source)
+    encoded_source, experts_outputs, source_gate_loss, source_clean_logits = encode(source_data, config.source)
     source_logits = cls_model(encoded_source)
 
     # Use config for uncertainty_k
@@ -355,15 +375,21 @@ def train(epoch):
     # Initialize losses to avoid potential unbound errors
     select_loss = torch.tensor(0.0, device=device)
     high_quality_semi_loss = torch.tensor(0.0, device=device)
-    semi_loss = torch.tensor(0.0, device=device) # Initialize base semi_loss too
+    # semi_loss = torch.tensor(0.0, device=device) # Initialize base semi_loss too
+
+    # Use a persistent dictionary to store expert selections across epochs
+    if not hasattr(train, 'expert_selections_cache'):
+        train.expert_selections_cache = {}
 
     # Check if combined_mask has any True values before proceeding with LLM part
     if combined_mask.sum() > 0:
-        graph2text_encoder = Graph2TextEncoder()
-        graph_description = graph2text_encoder.encode(source_data.edge_index, mask=combined_mask, num_nodes=source_data.num_nodes)
+        # Only call LLM every llm_interval epochs
+        uncertainty_node_indices = torch.where(uncertainty_mask)[0].tolist()
+        if (epoch-1) % config.llm_interval == 0:
+            graph2text_encoder = Graph2TextEncoder()
+            graph_description = graph2text_encoder.encode(source_data.edge_index, mask=combined_mask, num_nodes=source_data.num_nodes)
 
-        # Use LLM for expert selection only if there are uncertain nodes
-        with torch.no_grad():
+            # Use LLM for expert selection only if there are uncertain nodes
             uncertainty_node_indices = torch.where(uncertainty_mask)[0].tolist()
             if not uncertainty_node_indices:
                 print(f"Epoch {epoch}: No high uncertainty nodes found, skipping LLM expert selection.")
@@ -386,8 +412,9 @@ def train(epoch):
                     4. Given the specific reason for the selection, it is necessary to be based on the actual structural characteristics of the node.
                     return in json format directly:
                     {{
-                        "expert": 0, 1, or 2, ..., up to {config.expert_num - 1}
-                        "reason": "your reason"
+                        "reason": "your reason",
+                        "expert": 0, 1, or 2, ..., up to {config.expert_num - 1},
+                        "probability": 0.x
                     }}
                     """
                     for node_id in uncertainty_node_indices
@@ -417,100 +444,108 @@ def train(epoch):
                     except Exception as e:
                         print(f"Epoch {epoch}: Ollama error for node {node_id}: {e}. Defaulting to random.")
                         expert_selections[node_id] = np.random.randint(0, config.expert_num) # Defaulting to random
-                # print(f'Epoch {epoch}: LLM Expert Selections: {expert_selections}')
+                    # print(f'Epoch {epoch}: LLM Expert Selections: {expert_selections}')
+                # Update the cache with new selections
+                train.expert_selections_cache.update(expert_selections)
+
+        else:
+            print(f"Epoch {epoch}: Not calling LLM (interval not reached). Using cached expert selections.")
+            expert_selections = train.expert_selections_cache
 
         # Calculate select_loss if expert_selections is not empty
+        
         if expert_selections:
-            moe_expert_indices, moe_expert_probs = encoder.get_node_expert_assignment(source_data.x, source_data.edge_index)
+            # moe_expert_indices, moe_expert_probs, moe_full_gates = encoder.get_node_expert_assignment(source_data.x, source_data.edge_index, k=config.expert_num) # Ensure k matches num_experts if needed
             num_experts = config.expert_num
             llm_expert_dist = torch.zeros(len(uncertainty_node_indices), num_experts, device=device)
-            moe_expert_dist = torch.zeros(len(uncertainty_node_indices), num_experts, device=device)
+            # Gather MoE probabilities for the specific uncertain nodes
+            uncertainty_node_indices_tensor = torch.tensor(uncertainty_node_indices, device=device, dtype=torch.long)
+            # Directly index the gates tensor from get_node_expert_assignment for the uncertain nodes
+            # The 'gates' returned by get_node_expert_assignment IS the probability distribution
+            # _, _, moe_full_gates = encoder.get_node_expert_assignment(source_data.x, source_data.edge_index, k=config.expert_num) # Get the full [N, num_experts] gate distribution
+            moe_expert_dist = source_clean_logits[uncertainty_node_indices_tensor] # Shape: [num_uncertain, num_experts]
 
-            uncertainty_node_indices_tensor = torch.tensor(uncertainty_node_indices, device=device)
+            # Build llm_expert_dist (target distribution)
+            llm_expert_indices_list = [expert_selections.get(node_id_int, 0) for node_id_int in uncertainty_node_indices]
+            llm_expert_indices_tensor = torch.tensor(llm_expert_indices_list, device=device, dtype=torch.long)
+            # Create one-hot encoding for LLM selections
+            llm_expert_dist = F.one_hot(llm_expert_indices_tensor, num_classes=num_experts).float()
 
-            for i, node_id_int in enumerate(uncertainty_node_indices):
-                llm_expert = expert_selections.get(node_id_int, 0) # Default to 0 if somehow missing
-                llm_expert_dist[i, llm_expert] = 1.0
+            # print(f"Epoch {epoch}: LLM expert distribution shape: {llm_expert_dist.shape}, MoE expert distribution shape: {moe_expert_dist.shape}")
 
-                # Get MoE probs for this specific node_id
-                # node_idx = torch.where(torch.arange(source_data.num_nodes, device=device) == node_id_int)[0] # Slow
-                # Use direct indexing assuming uncertainty_node_indices are valid indices
-                moe_probs_for_node = torch.zeros(num_experts, device=device)
-                for k_idx in range(encoder.k): # Assuming encoder.k is accessible and is 1 based on MoE init
-                    expert_idx = moe_expert_indices[node_id_int, k_idx].item()
-                    expert_prob = moe_expert_probs[node_id_int, k_idx].item()
-                    moe_probs_for_node[expert_idx] += expert_prob # Sum probabilities if k > 1 and experts repeat
-                moe_expert_dist[i] = moe_probs_for_node
+            # temperature = 2.0 # Or use a config parameter
+            # llm_soft = torch.softmax(llm_expert_dist / temperature, dim=-1)
+            # moe_soft = torch.softmax(moe_expert_dist / temperature, dim=-1)
 
+            # print(f"Epoch {epoch}: LLM expert distribution: {llm_soft}, MoE expert distribution: {moe_soft}")
 
-            temperature = 2.0
-            llm_soft = torch.softmax(llm_expert_dist / temperature, dim=-1)
-            moe_soft = torch.softmax(moe_expert_dist / temperature, dim=-1)
             # Ensure no log(0)
-            select_loss = torch.nn.functional.kl_div(
-                (moe_soft + 1e-9).log(), llm_soft.detach(), reduction='batchmean', log_target=False
-            ) * (temperature ** 2)
-            # print(f"Epoch {epoch}: KL Loss: {select_loss.item()}")
-        else:
-            # select_loss remains 0.0 if no uncertain nodes / LLM calls
-             pass
+            # select_loss = torch.nn.functional.kl_div(
+            #     (moe_soft + 1e-9).log(), # input (log prob)
+            #     llm_soft,      # target (prob) - detached correctly
+            #     reduction='batchmean',
+            #     log_target=False        # target is not log prob
+            # ) * (temperature ** 2) # Scaling factor for temperature
+            select_loss = torch.nn.functional.cross_entropy(
+                moe_expert_dist, llm_expert_dist
+            )
 
 
     # Classifier loss:
     cls_loss = loss_func(source_logits[label_mask], source_data.y[label_mask])
 
     # Pseudo labeling and semi-supervised loss:
-    with torch.no_grad(): # Don't need gradients for pseudo-label generation
-        _, s_plabel = torch.max(source_logits, dim=1)
-        s_plabel[label_mask] = source_data.y[label_mask] # Correct known labels
-        s_weight = get_renode_weight(source_data, s_plabel).to(device)
-        s_plabel_onehot = F.one_hot(s_plabel, source_data.num_classes).float() # Use float
+    # with torch.no_grad(): # Don't need gradients for pseudo-label generation
+    _, s_plabel = torch.max(source_logits, dim=1)
+    s_plabel[label_mask] = source_data.y[label_mask] # Correct known labels
+    s_weight = get_renode_weight(source_data, s_plabel).to(device)
+    s_plabel_onehot = F.one_hot(s_plabel, source_data.num_classes).float() # Use float
 
     # Calculate base semi_loss only if there are unlabeled nodes
-    if (~label_mask).sum() > 0:
-        semi_loss = Entropy(source_logits[~label_mask], s_weight[~label_mask], s_plabel_onehot[~label_mask])
-    else:
-        semi_loss = torch.tensor(0.0, device=device)
+    # if (~label_mask).sum() > 0:
+    #     semi_loss = Entropy(source_logits[~label_mask], s_weight[~label_mask], s_plabel_onehot[~label_mask])
+    # else:
+    #     semi_loss = torch.tensor(0.0, device=device)
 
     # Calculate high-quality semi-loss
-    with torch.no_grad(): # Calculations for mask don't need gradient
+    # with torch.no_grad(): # Calculations for mask don't need gradient
         # Calculate MoE entropy on unlabeled data
-        if (~label_mask).sum() > 0:
-            moe_softmax = nn.Softmax(dim=-1)(source_logits[~label_mask])
-            moe_entropy = -torch.sum(moe_softmax * torch.log(moe_softmax + 1e-5), dim=1)
+    if (~label_mask).sum() > 0:
+        moe_softmax = nn.Softmax(dim=-1)(source_logits[~label_mask])
+        moe_entropy = -torch.sum(moe_softmax * torch.log(moe_softmax + 1e-5), dim=1)
 
-            # Calculate average expert entropy on unlabeled data
-            num_experts = experts_outputs.shape[1]
-            expert_entropies = torch.zeros(experts_outputs.shape[0], num_experts, device=device) # Size should match experts_outputs
-            # Iterate only over unlabeled nodes for efficiency
-            unlabeled_indices = torch.where(~label_mask)[0]
-            if unlabeled_indices.numel() > 0:
-                 # expert_outputs for unlabeled nodes only: experts_outputs[unlabeled_indices]
-                 # shape: [num_unlabeled, num_experts, d_feature]
-                 unlabeled_experts_outputs = experts_outputs[unlabeled_indices]
-                 num_unlabeled = unlabeled_experts_outputs.shape[0]
-                 expert_entropies_unlabeled = torch.zeros(num_unlabeled, num_experts, device=device)
+        # Calculate average expert entropy on unlabeled data
+        num_experts = experts_outputs.shape[1]
+        expert_entropies = torch.zeros(experts_outputs.shape[0], num_experts, device=device) # Size should match experts_outputs
+        # Iterate only over unlabeled nodes for efficiency
+        unlabeled_indices = torch.where(~label_mask)[0]
+        if unlabeled_indices.numel() > 0:
+                # expert_outputs for unlabeled nodes only: experts_outputs[unlabeled_indices]
+                # shape: [num_unlabeled, num_experts, d_feature]
+                unlabeled_experts_outputs = experts_outputs[unlabeled_indices]
+                num_unlabeled = unlabeled_experts_outputs.shape[0]
+                expert_entropies_unlabeled = torch.zeros(num_unlabeled, num_experts, device=device)
 
-                 for i in range(num_experts):
-                     expert_logits_unlabeled = cls_model(unlabeled_experts_outputs[:, i, :])
-                     expert_softmax_unlabeled = nn.Softmax(dim=-1)(expert_logits_unlabeled)
-                     expert_entropies_unlabeled[:, i] = -torch.sum(expert_softmax_unlabeled * torch.log(expert_softmax_unlabeled + 1e-5), dim=1)
+                for i in range(num_experts):
+                    expert_logits_unlabeled = cls_model(unlabeled_experts_outputs[:, i, :])
+                    expert_softmax_unlabeled = nn.Softmax(dim=-1)(expert_logits_unlabeled)
+                    expert_entropies_unlabeled[:, i] = -torch.sum(expert_softmax_unlabeled * torch.log(expert_softmax_unlabeled + 1e-5), dim=1)
 
-                 avg_expert_entropy = torch.mean(expert_entropies_unlabeled, dim=1)
-                 high_quality_mask_unlabeled = moe_entropy < avg_expert_entropy
+                avg_expert_entropy = torch.mean(expert_entropies_unlabeled, dim=1)
+                high_quality_mask_unlabeled = moe_entropy < avg_expert_entropy
 
-                 # Calculate loss only on high quality subset
-                 if high_quality_mask_unlabeled.sum() > 0:
-                     high_quality_semi_loss = Entropy(source_logits[unlabeled_indices][high_quality_mask_unlabeled],
-                                                    s_weight[unlabeled_indices][high_quality_mask_unlabeled],
-                                                    s_plabel_onehot[unlabeled_indices][high_quality_mask_unlabeled])
-                 else:
-                     high_quality_semi_loss = torch.tensor(0.0, device=device)
-            else: # No unlabeled nodes
-                 high_quality_semi_loss = torch.tensor(0.0, device=device)
-
+                # Calculate loss only on high quality subset
+                if high_quality_mask_unlabeled.sum() > 0:
+                    high_quality_semi_loss = Entropy(source_logits[unlabeled_indices][high_quality_mask_unlabeled],
+                                                s_weight[unlabeled_indices][high_quality_mask_unlabeled],
+                                                s_plabel_onehot[unlabeled_indices][high_quality_mask_unlabeled])
+                else:
+                    high_quality_semi_loss = torch.tensor(0.0, device=device)
         else: # No unlabeled nodes
-             high_quality_semi_loss = torch.tensor(0.0, device=device)
+                high_quality_semi_loss = torch.tensor(0.0, device=device)
+
+    else: # No unlabeled nodes
+            high_quality_semi_loss = torch.tensor(0.0, device=device)
 
 
     gate_loss = source_gate_loss # Currently only source gate loss
@@ -518,18 +553,21 @@ def train(epoch):
     # Calculate total loss
     # Ensure all components are tensors
     epoch_weight = float(epoch) / epochs
-    loss = cls_loss + gate_loss + select_loss + epoch_weight * (semi_loss + high_quality_semi_loss)
+    # epoch_weight = 0
+
+    loss = cls_loss + epoch_weight * (config.semi_weight * high_quality_semi_loss + config.select_weight * select_loss) #+ semi_loss
+    # loss = gate_loss + epoch_weight * (config.semi_weight * high_quality_semi_loss) + config.select_weight * select_loss
+    # loss = cls_loss + gate_loss + (config.semi_weight * high_quality_semi_loss)
 
     # --- W&B Logging for Training Step ---
     wandb.log({
         'epoch': epoch,
         'train/cls_loss': cls_loss.item(),
         'train/gate_loss': gate_loss.item(),
-        'train/select_loss': select_loss.item() if isinstance(select_loss, torch.Tensor) else select_loss, # Handle non-tensor case
-        'train/semi_loss': semi_loss.item(),
-        'train/high_quality_semi_loss': high_quality_semi_loss.item() if isinstance(high_quality_semi_loss, torch.Tensor) else high_quality_semi_loss,
+        'train/select_loss': select_loss.item(), # Handle non-tensor case
+        # 'train/semi_loss': semi_loss.item(),
+        'train/high_quality_semi_loss': high_quality_semi_loss.item(),
         'train/total_loss': loss.item(),
-        'train/grad_reverse_rate': GradReverse.rate # Log the rate
     })
     # --- End W&B Logging ---
 
@@ -538,9 +576,11 @@ def train(epoch):
 
     optimizer.zero_grad()
     loss.backward()
+    # print(f'grad of moe router: {encoder.w_gate.grad}, grad of cls: {cls_model[0].weight.grad}, {cls_model[0].bias.grad}')
     # Gradient clipping (optional, but can help stability)
     # torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
     optimizer.step()
+    # optimizer_moe.step() # Update MoE gate separately if needed
 
 
 # --- Training Loop ---
@@ -577,30 +617,6 @@ for epoch in range(1, epochs + 1): # Run for `epochs` epochs (e.g., 1 to 200)
             best_micro_f1 = micro_f1
             best_epoch = epoch
             print(f"*** New best target accuracy at epoch {epoch}: {best_target_acc:.4f} ***")
-
-            # Save best model checkpoint (Optional but recommended)
-            # checkpoint_path = f"checkpoints/best_model_ep{epoch}.pt"
-            # os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
-            # torch.save({
-            #     'epoch': epoch,
-            #     'encoder_state_dict': encoder.state_dict(),
-            #     'cls_model_state_dict': cls_model.state_dict(),
-            #     'optimizer_state_dict': optimizer.state_dict(),
-            #     'best_target_acc': best_target_acc,
-            # }, checkpoint_path)
-            # wandb.save(checkpoint_path) # Save checkpoint to W&B
-
-            # Save embeddings for the best epoch
-            embedding_path = f'log/{config.source}_{config.target}_embeddings_best.pkl'
-            os.makedirs(os.path.dirname(embedding_path), exist_ok=True)
-            with open(embedding_path, 'wb') as f:
-                pickle.dump([output_source.cpu().detach().numpy(), output_target.cpu().detach().numpy()], f)
-            # --- W&B Artifact Logging (Optional) ---
-            # Log the best embeddings as an artifact
-            # artifact_emb = wandb.Artifact(f'{config.source}_{config.target}_best_embeddings', type='model_outputs')
-            # artifact_emb.add_file(embedding_path)
-            # wandb.log_artifact(artifact_emb)
-            # --- End W&B Artifact Logging ---
 
 
     except Exception as e:

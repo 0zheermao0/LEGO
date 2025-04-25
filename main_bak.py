@@ -19,7 +19,7 @@ import pickle
 warnings.filterwarnings("ignore", category=UserWarning)
 import math
 from sklearn.metrics import f1_score
-from gnn.moe import MoE
+from gnn.moe_bak import MoE
 from common.graph_encoder import GraphEncoder as Graph2TextEncoder
 from transformers import AutoModel, AutoTokenizer, AutoModelForCausalLM
 import json
