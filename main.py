@@ -213,7 +213,7 @@ loss_func = nn.CrossEntropyLoss().to(device)
 
 # Use config for model hyperparameters
 # num_hops_config = [1, 2, 3][:config.expert_num] if config.expert_num >= 3 else [1] * config.expert_num
-num_hops_config = [1, 1, 1][:config.expert_num] if config.expert_num >= 3 else [1] * config.expert_num
+num_hops_config = [1, 2, 3][:config.expert_num] if config.expert_num >= 3 else [1] * config.expert_num
 encoder = MoE(input_size=source_data.num_features, output_size=config.encoder_dim, num_experts=config.expert_num, k=1
           , coef=config.gate_coef, gnn_type='ppmi', num_hops=num_hops_config).to(device)
 
