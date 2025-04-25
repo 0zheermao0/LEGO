@@ -212,7 +212,8 @@ def get_renode_weight(data, pseudo_label):
 loss_func = nn.CrossEntropyLoss().to(device)
 
 # Use config for model hyperparameters
-num_hops_config = [1, 2, 3][:config.expert_num] if config.expert_num >= 3 else [1] * config.expert_num
+# num_hops_config = [1, 2, 3][:config.expert_num] if config.expert_num >= 3 else [1] * config.expert_num
+num_hops_config = [1, 1, 1][:config.expert_num] if config.expert_num >= 3 else [1] * config.expert_num
 encoder = MoE(input_size=source_data.num_features, output_size=config.encoder_dim, num_experts=config.expert_num, k=1
           , coef=config.gate_coef, gnn_type='ppmi', num_hops=num_hops_config).to(device)
 
@@ -387,8 +388,7 @@ def train(epoch):
         uncertainty_node_indices = torch.where(uncertainty_mask)[0].tolist()
         if (epoch-1) % config.llm_interval == 0:
             graph2text_encoder = Graph2TextEncoder()
-            graph_description = graph2text_encoder.encode(source_data.edge_index, mask=combined_mask, num_nodes=source_data.num_nodes)
-
+            # ...existing code...
             # Use LLM for expert selection only if there are uncertain nodes
             uncertainty_node_indices = torch.where(uncertainty_mask)[0].tolist()
             if not uncertainty_node_indices:
@@ -397,8 +397,25 @@ def train(epoch):
             else:
                 print(f"Epoch {epoch}: Found {len(uncertainty_node_indices)} high uncertainty nodes. Querying LLM...")
                 expert_selections = {}
-                prompts = [
-                    f"""
+                prompts = []
+                for node_id in uncertainty_node_indices:
+                    # 构造mask: 只包含当前node和其邻居
+                    node_mask = torch.zeros(source_data.num_nodes, dtype=torch.bool, device=source_data.edge_index.device)
+                    node_mask[node_id] = True
+                    # 找到所有邻居
+                    neighbors = set()
+                    edge_index_np = source_data.edge_index.cpu().numpy()
+                    for i in range(edge_index_np.shape[1]):
+                        src, dst = edge_index_np[0, i], edge_index_np[1, i]
+                        if src == node_id:
+                            neighbors.add(dst)
+                        if dst == node_id:
+                            neighbors.add(src)
+                    for n in neighbors:
+                        node_mask[n] = True
+                    # 用mask生成graph_description
+                    graph_description = graph2text_encoder.encode(source_data.edge_index, mask=node_mask, num_nodes=source_data.num_nodes)
+                    prompt = f"""
                     You are an expert on GNN experts selector, given graph: {graph_description}
                     and {config.expert_num} GNN experts: (0:1-hop, 1:2-hop, 2:3-hop, ...) {' '.join([f'{i}:{i+1}-hop' for i in range(config.expert_num)])}
                     - 1-hop: Use when direct neighbors provide sufficient classification signals.
@@ -417,8 +434,7 @@ def train(epoch):
                         "probability": 0.x
                     }}
                     """
-                    for node_id in uncertainty_node_indices
-                ]
+                    prompts.append(prompt)
                 # Use config.llm
                 for idx, node_id in enumerate(uncertainty_node_indices):
                     prompt = prompts[idx]
@@ -426,7 +442,10 @@ def train(epoch):
                         response = ollama.generate(
                             model=config.llm,
                             prompt=prompt,
-                            format='json'
+                            format='json',
+                            options={
+                                'temperature': 0
+                            } # Adjust temperature as needed
                         )
                         json_output_str = response['response']
                         try:
@@ -444,9 +463,14 @@ def train(epoch):
                     except Exception as e:
                         print(f"Epoch {epoch}: Ollama error for node {node_id}: {e}. Defaulting to random.")
                         expert_selections[node_id] = np.random.randint(0, config.expert_num) # Defaulting to random
-                    # print(f'Epoch {epoch}: LLM Expert Selections: {expert_selections}')
                 # Update the cache with new selections
                 train.expert_selections_cache.update(expert_selections)
+
+                # 打印每次选择的 uncertainty node id 及 llm 的 choice
+                for node_id in uncertainty_node_indices:
+                    expert = expert_selections.get(node_id, None)
+                    print(f"Epoch {epoch}: LLM selected expert {expert} for uncertainty node {node_id}")
+# ...existing code...
 
         else:
             print(f"Epoch {epoch}: Not calling LLM (interval not reached). Using cached expert selections.")
