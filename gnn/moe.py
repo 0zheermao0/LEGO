@@ -139,10 +139,11 @@ class MoE(nn.Module):
             self.experts.append(expert)
         # Small GNNs for gate and noise prediction
         self.gate_gnn = nn.Sequential(
-            PPMIConv(input_size, input_size),
-            nn.ReLU(),
             PPMIConv(input_size, num_experts),
-            nn.ReLU()
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            # PPMIConv(input_size, num_experts),
+            # nn.ReLU()
         )
         self.noise_gnn = GCNConv(input_size, num_experts, normalize=False)
         self.softplus = nn.Softplus()

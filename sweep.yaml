@@ -4,10 +4,10 @@ metric:
   name: eval/best_target_acc # The metric to optimize (use wandb.summary key)
   goal: maximize # Or minimize
 parameters:
-  # learning_rate:
-  #   distribution: log_uniform_values
-  #   min: 1e-4
-  #   max: 1e-2
+  learning_rate:
+    distribution: log_uniform_values
+    min: 1e-3
+    max: 5e-3
   # weight_decay:
   #   distribution: log_uniform_values
   #   min: 1e-4
@@ -20,10 +20,10 @@ parameters:
   #   values: [256, 512]
   # # expert_num:
   # #   values: [2, 3, 4]
-  uncertainty_k:
-    distribution: int_uniform
-    min: 100
-    max: 500
+  # uncertainty_k:
+  #   distribution: int_uniform
+  #   min: 100
+  #   max: 500
   # gate_coef:
   #   distribution: log_uniform_values
   #   min: 1e-3
@@ -32,8 +32,8 @@ parameters:
   #   values: [qwen2.5:3b, qwen2.5:7b]
   select_weight:
     distribution: uniform
-    min: 1
-    max: 10
+    min: 0.01
+    max: 0.05
   # semi_weight:
   #   distribution: uniform
   #   min: 0.5
