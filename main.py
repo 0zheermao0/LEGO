@@ -356,6 +356,83 @@ def get_max_hop_neighbors(edge_index, num_nodes, mask):
 
     return neighbor_mask
 
+# ========== LLM专家选择预处理 ==========
+expert_selections_path = f"log/{config.source}-{config.target}-expert-selections.json"
+if os.path.exists(expert_selections_path):
+    with open(expert_selections_path, 'r') as f:
+        expert_selections = json.load(f)
+    # 转换key为int（json存储时key为str）
+    expert_selections = {int(k): v for k, v in range(expert_selections.items())}
+    print(f"Loaded expert selections from {expert_selections_path}, total: {len(expert_selections)}")
+else:
+    print(f"Generating expert selections for all nodes via LLM...")
+    expert_selections = {}
+    graph2text_encoder = Graph2TextEncoder()
+    prompts = []
+    for node_id in range(source_data.num_nodes):
+        node_mask = torch.zeros(source_data.num_nodes, dtype=torch.bool, device=source_data.edge_index.device)
+        node_mask[node_id] = True
+        neighbors = set()
+        edge_index_np = source_data.edge_index.cpu().numpy()
+        for i in range(edge_index_np.shape[1]):
+            src, dst = edge_index_np[0, i], edge_index_np[1, i]
+            if src == node_id:
+                neighbors.add(dst)
+            if dst == node_id:
+                neighbors.add(src)
+        for n in neighbors:
+            node_mask[n] = True
+        graph_description = graph2text_encoder.encode(source_data.edge_index, mask=node_mask, num_nodes=source_data.num_nodes)
+        prompt = f"""
+        You are an expert on GNN experts selector, given node and its neighorbood: {graph_description}
+        and {config.expert_num} GNN experts: (0:1-hop, 1:2-hop, 2:3-hop, ...) {' '.join([f'{i}:{i+1}-hop' for i in range(config.expert_num)])}
+        - 1-hop: Use when direct neighbors provide sufficient classification signals.
+        - 2-hop: Use for indirect relationships.
+        - 3-hop: Use for long-range dependencies or hierarchical structures.
+        give out your choice on expert directly for node {node_id}.
+        Please note:
+        1. If the structure around the node is simple and there are few neighbors, it is recommended to choose 1-hop expert
+        2. If the node has more 2-hop neighbors, it is recommended to choose 2-hop expert
+        3. If the node is in a complex community structure, it is recommended to choose 3-hop expert
+        4. Given the specific reason for the selection, it is necessary to be based on the actual structural characteristics of the node.
+        return in json format directly:
+        {{
+            "reason": "your reason",
+            "expert": 0, 1, or 2, ..., up to {config.expert_num - 1},
+            "probability": 0.x
+        }}
+        """
+        prompts.append(prompt)
+    for node_id, prompt in enumerate(prompts):
+        try:
+            response = ollama.generate(
+                model=config.llm,
+                prompt=prompt,
+                format='json',
+                options={'temperature': 0}
+            )
+            json_output_str = response['response']
+            try:
+                parsed_json = json.loads(json_output_str)
+                expert = parsed_json.get("expert")
+                if isinstance(expert, int) and 0 <= expert < config.expert_num:
+                    expert_selections[node_id] = expert
+                else:
+                    print(f"Warning: Invalid expert value {expert} for node {node_id}. Defaulting to random.")
+                    expert_selections[node_id] = np.random.randint(0, config.expert_num)
+            except json.JSONDecodeError as e:
+                print(f"Node {node_id}: JSONDecodeError: {e}. Response: '{json_output_str}'. Defaulting to random.")
+                expert_selections[node_id] = np.random.randint(0, config.expert_num)
+        except Exception as e:
+            print(f"Node {node_id}: Ollama error: {e}. Defaulting to random.")
+            expert_selections[node_id] = np.random.randint(0, config.expert_num)
+        if (node_id+1) % 100 == 0:
+            print(f"Processed {node_id+1}/{source_data.num_nodes} nodes...")
+    with open(expert_selections_path, 'w') as f:
+        json.dump(expert_selections, f)
+    print(f"Expert selections saved to {expert_selections_path}")
+# ========== END LLM专家选择预处理 ==========
+
 def train(epoch):
     for model in models:
         model.train()
@@ -416,7 +493,7 @@ def train(epoch):
                     # 用mask生成graph_description
                     graph_description = graph2text_encoder.encode(source_data.edge_index, mask=node_mask, num_nodes=source_data.num_nodes)
                     prompt = f"""
-                    You are an expert on GNN experts selector, given graph: {graph_description}
+                    You are an expert on GNN experts selector, given node and its neighorbood: {graph_description}
                     and {config.expert_num} GNN experts: (0:1-hop, 1:2-hop, 2:3-hop, ...) {' '.join([f'{i}:{i+1}-hop' for i in range(config.expert_num)])}
                     - 1-hop: Use when direct neighbors provide sufficient classification signals.
                     - 2-hop: Use for indirect relationships.
@@ -532,45 +609,43 @@ def train(epoch):
     #     semi_loss = torch.tensor(0.0, device=device)
 
     # Calculate high-quality semi-loss
-    # with torch.no_grad(): # Calculations for mask don't need gradient
-        # Calculate MoE entropy on unlabeled data
+    # 用 LLM 专家选择的 entropy 与其他专家最大 entropy 比较
     if (~label_mask).sum() > 0:
-        moe_softmax = nn.Softmax(dim=-1)(source_logits[~label_mask])
-        moe_entropy = -torch.sum(moe_softmax * torch.log(moe_softmax + 1e-5), dim=1)
-
-        # Calculate average expert entropy on unlabeled data
         num_experts = experts_outputs.shape[1]
-        expert_entropies = torch.zeros(experts_outputs.shape[0], num_experts, device=device) # Size should match experts_outputs
-        # Iterate only over unlabeled nodes for efficiency
         unlabeled_indices = torch.where(~label_mask)[0]
-        if unlabeled_indices.numel() > 0:
-                # expert_outputs for unlabeled nodes only: experts_outputs[unlabeled_indices]
-                # shape: [num_unlabeled, num_experts, d_feature]
-                unlabeled_experts_outputs = experts_outputs[unlabeled_indices]
-                num_unlabeled = unlabeled_experts_outputs.shape[0]
-                expert_entropies_unlabeled = torch.zeros(num_unlabeled, num_experts, device=device)
-
-                for i in range(num_experts):
-                    expert_logits_unlabeled = cls_model(unlabeled_experts_outputs[:, i, :])
-                    expert_softmax_unlabeled = nn.Softmax(dim=-1)(expert_logits_unlabeled)
-                    expert_entropies_unlabeled[:, i] = -torch.sum(expert_softmax_unlabeled * torch.log(expert_softmax_unlabeled + 1e-5), dim=1)
-
-                avg_expert_entropy = torch.mean(expert_entropies_unlabeled, dim=1)
-                high_quality_mask_unlabeled = moe_entropy < avg_expert_entropy
-
-                # Calculate loss only on high quality subset
-                if high_quality_mask_unlabeled.sum() > 0:
-                    high_quality_semi_loss = Entropy(source_logits[unlabeled_indices][high_quality_mask_unlabeled],
-                                                s_weight[unlabeled_indices][high_quality_mask_unlabeled],
-                                                s_plabel_onehot[unlabeled_indices][high_quality_mask_unlabeled])
-                else:
-                    high_quality_semi_loss = torch.tensor(0.0, device=device)
-        else: # No unlabeled nodes
+        if unlabeled_indices.numel() > 0 and expert_selections:
+            # 获取未标记节点的 LLM 专家选择
+            llm_expert_indices = []
+            for idx in unlabeled_indices.tolist():
+                llm_expert_indices.append(expert_selections.get(idx, 0))
+            llm_expert_indices_tensor = torch.tensor(llm_expert_indices, device=device, dtype=torch.long)
+            # 计算所有专家的 entropy
+            unlabeled_experts_outputs = experts_outputs[unlabeled_indices]  # [num_unlabeled, num_experts, d_feature]
+            num_unlabeled = unlabeled_experts_outputs.shape[0]
+            expert_entropies_unlabeled = torch.zeros(num_unlabeled, num_experts, device=device)
+            for i in range(num_experts):
+                expert_logits_unlabeled = cls_model(unlabeled_experts_outputs[:, i, :])
+                expert_softmax_unlabeled = nn.Softmax(dim=-1)(expert_logits_unlabeled)
+                expert_entropies_unlabeled[:, i] = -torch.sum(expert_softmax_unlabeled * torch.log(expert_softmax_unlabeled + 1e-5), dim=1)
+            # LLM 专家 entropy
+            llm_expert_entropy = expert_entropies_unlabeled[torch.arange(num_unlabeled), llm_expert_indices_tensor]
+            # 其他专家最大 entropy
+            mask = torch.ones_like(expert_entropies_unlabeled, dtype=torch.bool)
+            mask[torch.arange(num_unlabeled), llm_expert_indices_tensor] = False
+            other_expert_entropy = expert_entropies_unlabeled.masked_fill(~mask, float('-inf'))
+            max_other_entropy, _ = other_expert_entropy.max(dim=1)
+            # high_quality: LLM 专家 entropy 小于其他专家最大 entropy
+            high_quality_mask_unlabeled = llm_expert_entropy < max_other_entropy
+            if high_quality_mask_unlabeled.sum() > 0:
+                high_quality_semi_loss = Entropy(source_logits[unlabeled_indices][high_quality_mask_unlabeled],
+                                            s_weight[unlabeled_indices][high_quality_mask_unlabeled],
+                                            s_plabel_onehot[unlabeled_indices][high_quality_mask_unlabeled])
+            else:
                 high_quality_semi_loss = torch.tensor(0.0, device=device)
-
-    else: # No unlabeled nodes
+        else:
             high_quality_semi_loss = torch.tensor(0.0, device=device)
-
+    else:
+        high_quality_semi_loss = torch.tensor(0.0, device=device)
 
     gate_loss = source_gate_loss # Currently only source gate loss
 
