@@ -357,59 +357,78 @@ def get_max_hop_neighbors(edge_index, num_nodes, mask):
     return neighbor_mask
 
 # ========== LLM专家选择预处理 ==========
-expert_selections_path = f"log/{config.source}-{config.target}-expert-selections.json"
+expert_selections_path = f"log/{config.source}-{config.target}-{config.llm}-selections.json"
+prompts_path = f"log/{config.source}-{config.target}-{config.llm}-prompts.pkl"
 if os.path.exists(expert_selections_path):
     with open(expert_selections_path, 'r') as f:
         expert_selections = json.load(f)
-    # 转换key为int（json存储时key为str）
-    expert_selections = {int(k): v for k, v in range(expert_selections.items())}
+    expert_selections = {int(k): v for k, v in expert_selections.items()}
     print(f"Loaded expert selections from {expert_selections_path}, total: {len(expert_selections)}")
 else:
     print(f"Generating expert selections for all nodes via LLM...")
     expert_selections = {}
     graph2text_encoder = Graph2TextEncoder()
-    prompts = []
-    for node_id in range(source_data.num_nodes):
-        node_mask = torch.zeros(source_data.num_nodes, dtype=torch.bool, device=source_data.edge_index.device)
-        node_mask[node_id] = True
-        neighbors = set()
-        edge_index_np = source_data.edge_index.cpu().numpy()
-        for i in range(edge_index_np.shape[1]):
-            src, dst = edge_index_np[0, i], edge_index_np[1, i]
-            if src == node_id:
-                neighbors.add(dst)
-            if dst == node_id:
-                neighbors.add(src)
-        for n in neighbors:
-            node_mask[n] = True
-        graph_description = graph2text_encoder.encode(source_data.edge_index, mask=node_mask, num_nodes=source_data.num_nodes)
-        prompt = f"""
-        You are an expert on GNN experts selector, given node and its neighorbood: {graph_description}
-        and {config.expert_num} GNN experts: (0:1-hop, 1:2-hop, 2:3-hop, ...) {' '.join([f'{i}:{i+1}-hop' for i in range(config.expert_num)])}
-        - 1-hop: Use when direct neighbors provide sufficient classification signals.
-        - 2-hop: Use for indirect relationships.
-        - 3-hop: Use for long-range dependencies or hierarchical structures.
-        give out your choice on expert directly for node {node_id}.
-        Please note:
-        1. If the structure around the node is simple and there are few neighbors, it is recommended to choose 1-hop expert
-        2. If the node has more 2-hop neighbors, it is recommended to choose 2-hop expert
-        3. If the node is in a complex community structure, it is recommended to choose 3-hop expert
-        4. Given the specific reason for the selection, it is necessary to be based on the actual structural characteristics of the node.
-        return in json format directly:
-        {{
-            "reason": "your reason",
-            "expert": 0, 1, or 2, ..., up to {config.expert_num - 1},
-            "probability": 0.x
-        }}
-        """
-        prompts.append(prompt)
+    # 优先尝试加载 prompts
+    if os.path.exists(prompts_path):
+        import pickle
+        with open(prompts_path, 'rb') as f:
+            prompts = pickle.load(f)
+        print(f"Loaded prompts from {prompts_path}")
+    else:
+        prompts = []
+        for node_id in range(source_data.num_nodes):
+            node_mask = torch.zeros(source_data.num_nodes, dtype=torch.bool, device=source_data.edge_index.device)
+            node_mask[node_id] = True
+            # 找到所有可达邻居（全通路）
+            edge_index_np = source_data.edge_index.cpu().numpy()
+            adj = [[] for _ in range(source_data.num_nodes)]
+            for i in range(edge_index_np.shape[1]):
+                src, dst = edge_index_np[0, i], edge_index_np[1, i]
+                adj[src].append(dst)
+                adj[dst].append(src)
+            visited = set([node_id])
+            queue = [node_id]
+            while queue:
+                current = queue.pop(0)
+                for neighbor in adj[current]:
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        queue.append(neighbor)
+            for n in visited:
+                node_mask[n] = True
+            graph_description = graph2text_encoder.encode(source_data.edge_index, mask=node_mask, num_nodes=source_data.num_nodes, style='adj_list')
+            prompt = f"""
+            You are an expert on GNN experts selector, given node and its neighorbood: {graph_description}
+            and {config.expert_num} GNN experts: (0:1-hop, 1:2-hop, 2:3-hop, ...) {' '.join([f'{i}:{i+1}-hop' for i in range(config.expert_num)])}
+            - 1-hop: Use when direct neighbors provide sufficient classification signals.
+            - 2-hop: Use for indirect relationships.
+            - 3-hop: Use for long-range dependencies or hierarchical structures.
+            give out your choice on expert directly for node {node_id}.
+            Please note:
+            1. If the structure around the node is simple and there are few neighbors, it is recommended to choose 1-hop expert
+            2. If the node has more 2-hop neighbors, it is recommended to choose 2-hop expert
+            3. If the node is in a complex community structure, it is recommended to choose 3-hop expert
+            4. Given the specific reason for the selection, it is necessary to be based on the actual structural characteristics of the node.
+            return in json format directly:
+            {{
+                "reason": "your reason",
+                "expert": 0, 1, or 2, ..., up to {config.expert_num - 1},
+                "probability": 0.x
+            }}
+            """
+            print(f"Prompt for node {node_id}: {prompt}")
+            prompts.append(prompt)
+        # 保存 prompts
+        with open(prompts_path, 'wb') as f:
+            pickle.dump(prompts, f)
+        print(f"Prompts saved to {prompts_path}")
     for node_id, prompt in enumerate(prompts):
         try:
             response = ollama.generate(
                 model=config.llm,
                 prompt=prompt,
                 format='json',
-                options={'temperature': 0}
+                options={'temperature': 0, 'num_ctx': 40960, 'num_predict': 4096}
             )
             json_output_str = response['response']
             try:
@@ -455,142 +474,22 @@ def train(epoch):
     high_quality_semi_loss = torch.tensor(0.0, device=device)
     # semi_loss = torch.tensor(0.0, device=device) # Initialize base semi_loss too
 
-    # Use a persistent dictionary to store expert selections across epochs
-    if not hasattr(train, 'expert_selections_cache'):
-        train.expert_selections_cache = {}
+    # 直接使用预先生成的 expert_selections
+    expert_selections_local = expert_selections
 
-    # Check if combined_mask has any True values before proceeding with LLM part
-    if combined_mask.sum() > 0:
-        # Only call LLM every llm_interval epochs
-        uncertainty_node_indices = torch.where(uncertainty_mask)[0].tolist()
-        if (epoch-1) % config.llm_interval == 0:
-            graph2text_encoder = Graph2TextEncoder()
-            # ...existing code...
-            # Use LLM for expert selection only if there are uncertain nodes
-            uncertainty_node_indices = torch.where(uncertainty_mask)[0].tolist()
-            if not uncertainty_node_indices:
-                print(f"Epoch {epoch}: No high uncertainty nodes found, skipping LLM expert selection.")
-                expert_selections = {}
-            else:
-                print(f"Epoch {epoch}: Found {len(uncertainty_node_indices)} high uncertainty nodes. Querying LLM...")
-                expert_selections = {}
-                prompts = []
-                for node_id in uncertainty_node_indices:
-                    # 构造mask: 只包含当前node和其邻居
-                    node_mask = torch.zeros(source_data.num_nodes, dtype=torch.bool, device=source_data.edge_index.device)
-                    node_mask[node_id] = True
-                    # 找到所有邻居
-                    neighbors = set()
-                    edge_index_np = source_data.edge_index.cpu().numpy()
-                    for i in range(edge_index_np.shape[1]):
-                        src, dst = edge_index_np[0, i], edge_index_np[1, i]
-                        if src == node_id:
-                            neighbors.add(dst)
-                        if dst == node_id:
-                            neighbors.add(src)
-                    for n in neighbors:
-                        node_mask[n] = True
-                    # 用mask生成graph_description
-                    graph_description = graph2text_encoder.encode(source_data.edge_index, mask=node_mask, num_nodes=source_data.num_nodes)
-                    prompt = f"""
-                    You are an expert on GNN experts selector, given node and its neighorbood: {graph_description}
-                    and {config.expert_num} GNN experts: (0:1-hop, 1:2-hop, 2:3-hop, ...) {' '.join([f'{i}:{i+1}-hop' for i in range(config.expert_num)])}
-                    - 1-hop: Use when direct neighbors provide sufficient classification signals.
-                    - 2-hop: Use for indirect relationships.
-                    - 3-hop: Use for long-range dependencies or hierarchical structures.
-                    give out your choice on expert directly for node {node_id}.
-                    Please note:
-                    1. If the structure around the node is simple and there are few neighbors, it is recommended to choose 1-hop expert
-                    2. If the node has more 2-hop neighbors, it is recommended to choose 2-hop expert
-                    3. If the node is in a complex community structure, it is recommended to choose 3-hop expert
-                    4. Given the specific reason for the selection, it is necessary to be based on the actual structural characteristics of the node.
-                    return in json format directly:
-                    {{
-                        "reason": "your reason",
-                        "expert": 0, 1, or 2, ..., up to {config.expert_num - 1},
-                        "probability": 0.x
-                    }}
-                    """
-                    prompts.append(prompt)
-                # Use config.llm
-                for idx, node_id in enumerate(uncertainty_node_indices):
-                    prompt = prompts[idx]
-                    try:
-                        response = ollama.generate(
-                            model=config.llm,
-                            prompt=prompt,
-                            format='json',
-                            options={
-                                'temperature': 0
-                            } # Adjust temperature as needed
-                        )
-                        json_output_str = response['response']
-                        try:
-                            parsed_json = json.loads(json_output_str)
-                            expert = parsed_json.get("expert") # Get expert value
-                            # Validate expert is int and within range
-                            if isinstance(expert, int) and 0 <= expert < config.expert_num:
-                                expert_selections[node_id] = expert
-                            else:
-                                print(f"Warning: Invalid expert value {expert} for node {node_id}. Defaulting to random.")
-                                expert_selections[node_id] = np.random.randint(0, config.expert_num)
-                        except json.JSONDecodeError as e:
-                            print(f"Epoch {epoch}: JSONDecodeError for node {node_id}: {e}. Response: '{json_output_str}'. Defaulting to random.")
-                            expert_selections[node_id] = np.random.randint(0, config.expert_num)
-                    except Exception as e:
-                        print(f"Epoch {epoch}: Ollama error for node {node_id}: {e}. Defaulting to random.")
-                        expert_selections[node_id] = np.random.randint(0, config.expert_num) # Defaulting to random
-                # Update the cache with new selections
-                train.expert_selections_cache.update(expert_selections)
-
-                # 打印每次选择的 uncertainty node id 及 llm 的 choice
-                for node_id in uncertainty_node_indices:
-                    expert = expert_selections.get(node_id, None)
-                    print(f"Epoch {epoch}: LLM selected expert {expert} for uncertainty node {node_id}")
-# ...existing code...
-
-        else:
-            print(f"Epoch {epoch}: Not calling LLM (interval not reached). Using cached expert selections.")
-            expert_selections = train.expert_selections_cache
-
-        # Calculate select_loss if expert_selections is not empty
-        
-        if expert_selections:
-            # moe_expert_indices, moe_expert_probs, moe_full_gates = encoder.get_node_expert_assignment(source_data.x, source_data.edge_index, k=config.expert_num) # Ensure k matches num_experts if needed
-            num_experts = config.expert_num
-            llm_expert_dist = torch.zeros(len(uncertainty_node_indices), num_experts, device=device)
-            # Gather MoE probabilities for the specific uncertain nodes
-            uncertainty_node_indices_tensor = torch.tensor(uncertainty_node_indices, device=device, dtype=torch.long)
-            # Directly index the gates tensor from get_node_expert_assignment for the uncertain nodes
-            # The 'gates' returned by get_node_expert_assignment IS the probability distribution
-            # _, _, moe_full_gates = encoder.get_node_expert_assignment(source_data.x, source_data.edge_index, k=config.expert_num) # Get the full [N, num_experts] gate distribution
-            moe_expert_dist = source_clean_logits[uncertainty_node_indices_tensor] # Shape: [num_uncertain, num_experts]
-
-            # Build llm_expert_dist (target distribution)
-            llm_expert_indices_list = [expert_selections.get(node_id_int, 0) for node_id_int in uncertainty_node_indices]
-            llm_expert_indices_tensor = torch.tensor(llm_expert_indices_list, device=device, dtype=torch.long)
-            # Create one-hot encoding for LLM selections
-            llm_expert_dist = F.one_hot(llm_expert_indices_tensor, num_classes=num_experts).float()
-
-            # print(f"Epoch {epoch}: LLM expert distribution shape: {llm_expert_dist.shape}, MoE expert distribution shape: {moe_expert_dist.shape}")
-
-            # temperature = 2.0 # Or use a config parameter
-            # llm_soft = torch.softmax(llm_expert_dist / temperature, dim=-1)
-            # moe_soft = torch.softmax(moe_expert_dist / temperature, dim=-1)
-
-            # print(f"Epoch {epoch}: LLM expert distribution: {llm_soft}, MoE expert distribution: {moe_soft}")
-
-            # Ensure no log(0)
-            # select_loss = torch.nn.functional.kl_div(
-            #     (moe_soft + 1e-9).log(), # input (log prob)
-            #     llm_soft,      # target (prob) - detached correctly
-            #     reduction='batchmean',
-            #     log_target=False        # target is not log prob
-            # ) * (temperature ** 2) # Scaling factor for temperature
-            select_loss = torch.nn.functional.cross_entropy(
-                moe_expert_dist, llm_expert_dist
-            )
-
+    # 只要有uncertainty节点就计算select_loss
+    uncertainty_node_indices = torch.where(uncertainty_mask)[0].tolist()
+    if uncertainty_node_indices:
+        num_experts = config.expert_num
+        llm_expert_dist = torch.zeros(len(uncertainty_node_indices), num_experts, device=device)
+        uncertainty_node_indices_tensor = torch.tensor(uncertainty_node_indices, device=device, dtype=torch.long)
+        moe_expert_dist = source_clean_logits[uncertainty_node_indices_tensor]
+        llm_expert_indices_list = [expert_selections_local.get(node_id_int, 0) for node_id_int in uncertainty_node_indices]
+        llm_expert_indices_tensor = torch.tensor(llm_expert_indices_list, device=device, dtype=torch.long)
+        llm_expert_dist = F.one_hot(llm_expert_indices_tensor, num_classes=num_experts).float()
+        select_loss = torch.nn.functional.cross_entropy(
+            moe_expert_dist, llm_expert_dist
+        )
 
     # Classifier loss:
     cls_loss = loss_func(source_logits[label_mask], source_data.y[label_mask])
@@ -613,11 +512,11 @@ def train(epoch):
     if (~label_mask).sum() > 0:
         num_experts = experts_outputs.shape[1]
         unlabeled_indices = torch.where(~label_mask)[0]
-        if unlabeled_indices.numel() > 0 and expert_selections:
+        if unlabeled_indices.numel() > 0 and expert_selections_local:
             # 获取未标记节点的 LLM 专家选择
             llm_expert_indices = []
             for idx in unlabeled_indices.tolist():
-                llm_expert_indices.append(expert_selections.get(idx, 0))
+                llm_expert_indices.append(expert_selections_local.get(idx, 0))
             llm_expert_indices_tensor = torch.tensor(llm_expert_indices, device=device, dtype=torch.long)
             # 计算所有专家的 entropy
             unlabeled_experts_outputs = experts_outputs[unlabeled_indices]  # [num_unlabeled, num_experts, d_feature]
@@ -756,6 +655,26 @@ with open(log_file_path, 'a') as f:
 # --- Save Log File to W&B (Optional) ---
 # wandb.save(log_file_path)
 # --- End Save Log File ---
+# Save final target embeddings for t-SNE visualization
+final_target_embeddings_path = f"log/{config.target}-final-embeddings.pt" # Or .npy
+final_target_labels_path = f"log/{config.target}-final-labels.pt" # Save labels too
+
+# Re-run test on target data to get final embeddings if not already available
+# Or, if test() was just run, use the 'output_target' variable directly if it's in scope
+# Assuming test was run in the last epoch evaluation:
+if 'output_target' in locals() and output_target is not None:
+    print(f"Saving final target embeddings to {final_target_embeddings_path}")
+    torch.save(output_target.cpu(), final_target_embeddings_path) # Save to CPU
+    print(f"Saving final target labels to {final_target_labels_path}")
+    torch.save(target_data.y.cpu(), final_target_labels_path) # Save labels
+else:
+    # If output_target is not available, run test again (might be slightly different if model state changed)
+    print("Re-running test to get final target embeddings...")
+    _, _, _, final_output_target = test(target_data, config.target)
+    print(f"Saving final target embeddings to {final_target_embeddings_path}")
+    torch.save(final_output_target.cpu(), final_target_embeddings_path)
+    print(f"Saving final target labels to {final_target_labels_path}")
+    torch.save(target_data.y.cpu(), final_target_labels_path)
 
 # --- Finish W&B Run ---
 wandb.finish()
