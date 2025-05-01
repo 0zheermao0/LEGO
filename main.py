@@ -16,6 +16,7 @@ import math
 from sklearn.metrics import f1_score
 import json
 import ollama
+import multiprocessing
 
 # --- W&B Integration ---
 import wandb
@@ -50,6 +51,7 @@ parser.add_argument("--gate_coef", type=float, default=1e-1)
 parser.add_argument("--select_weight", type=float, default=1)
 parser.add_argument("--semi_weight", type=float, default=1)
 parser.add_argument("--llm_interval", type=int, default=20, help="Interval of epochs to call LLM for expert selection")
+parser.add_argument("--hop", type=int, default=5)
 # --- W&B specific arguments (optional, can be set in wandb.init or sweep config) ---
 parser.add_argument("--wandb_project", type=str, default="GNN-Domain-Adaptation-Sweep")
 parser.add_argument("--wandb_entity", type=str, default=None, help="Your W&B username or team name") # Or set directly in wandb.init
@@ -207,6 +209,58 @@ def get_renode_weight(data, pseudo_label):
     rn_weight = [(base_w + 0.5 * scale_w * (1 + math.cos(x*1.0*math.pi/(nnode-1)))) for x in totoro_rank]
     rn_weight = torch.from_numpy(np.array(rn_weight)).type(torch.FloatTensor)
     return rn_weight
+
+def build_prompt_for_node(args):
+    node_id, source_data, config_dict, expert_num, hop = args
+    node_mask = torch.zeros(source_data.num_nodes, dtype=torch.bool)
+    node_mask[node_id] = True
+
+    # 遍历指定跳数的所有邻居
+    max_hop = hop
+    edge_index_np = source_data.edge_index.cpu().numpy()
+    adj = [[] for _ in range(source_data.num_nodes)]
+    for i in range(edge_index_np.shape[1]):
+        src, dst = edge_index_np[0, i], edge_index_np[1, i]
+        adj[src].append(dst)
+        adj[dst].append(src)
+
+    visited = set([node_id])
+    current_level = set([node_id])
+    for hop in range(1, max_hop + 1):
+        next_level = set()
+        for current in current_level:
+            for neighbor in adj[current]:
+                if neighbor not in visited:
+                    next_level.add(neighbor)
+                    visited.add(neighbor)
+        current_level = next_level
+    for n in visited:
+        node_mask[n] = True
+
+    graph_description = graph2text_encoder.encode(
+        source_data.edge_index, mask=node_mask, num_nodes=source_data.num_nodes, style='natural'
+    )
+    prompt = f"""
+    You are an expert on GNN experts selector, given node and its neighorbood: {graph_description}
+    and {config.expert_num} GNN experts: (0:1-hop, 1:2-hop, 2:3-hop, ...) {' '.join([f'{i}:{i+1}-hop' for i in range(config.expert_num)])}
+    - 1-hop: Use when direct neighbors provide sufficient classification signals.
+    - 2-hop: Use for indirect relationships.
+    - 3-hop: Use for long-range dependencies or hierarchical structures.
+    give out your choice on expert directly for node {node_id}.
+    Please note:
+    1. If the structure around the node is simple and there are few neighbors, it is recommended to choose 1-hop expert
+    2. If the node has more 2-hop neighbors, it is recommended to choose 2-hop expert
+    3. If the node is in a complex community structure, it is recommended to choose 3-hop expert
+    4. Given the specific reason for the selection, it is necessary to be based on the actual structural characteristics of the node.
+    return in json format directly:
+    {{
+        "reason": "your reason",
+        "expert": 0, 1, or 2, ..., up to {config.expert_num - 1},
+        "probability": 0.x
+    }}
+    """
+    print(f"Prompt for node {node_id}: {prompt}")  # Debugging line to check the prompt
+    return prompt
 
 
 loss_func = nn.CrossEntropyLoss().to(device)
@@ -376,48 +430,17 @@ else:
         print(f"Loaded prompts from {prompts_path}")
     else:
         prompts = []
-        for node_id in range(source_data.num_nodes):
-            node_mask = torch.zeros(source_data.num_nodes, dtype=torch.bool, device=source_data.edge_index.device)
-            node_mask[node_id] = True
-            # 找到所有可达邻居（全通路）
-            edge_index_np = source_data.edge_index.cpu().numpy()
-            adj = [[] for _ in range(source_data.num_nodes)]
-            for i in range(edge_index_np.shape[1]):
-                src, dst = edge_index_np[0, i], edge_index_np[1, i]
-                adj[src].append(dst)
-                adj[dst].append(src)
-            visited = set([node_id])
-            queue = [node_id]
-            while queue:
-                current = queue.pop(0)
-                for neighbor in adj[current]:
-                    if neighbor not in visited:
-                        visited.add(neighbor)
-                        queue.append(neighbor)
-            for n in visited:
-                node_mask[n] = True
-            graph_description = graph2text_encoder.encode(source_data.edge_index, mask=node_mask, num_nodes=source_data.num_nodes, style='adj_list')
-            prompt = f"""
-            You are an expert on GNN experts selector, given node and its neighorbood: {graph_description}
-            and {config.expert_num} GNN experts: (0:1-hop, 1:2-hop, 2:3-hop, ...) {' '.join([f'{i}:{i+1}-hop' for i in range(config.expert_num)])}
-            - 1-hop: Use when direct neighbors provide sufficient classification signals.
-            - 2-hop: Use for indirect relationships.
-            - 3-hop: Use for long-range dependencies or hierarchical structures.
-            give out your choice on expert directly for node {node_id}.
-            Please note:
-            1. If the structure around the node is simple and there are few neighbors, it is recommended to choose 1-hop expert
-            2. If the node has more 2-hop neighbors, it is recommended to choose 2-hop expert
-            3. If the node is in a complex community structure, it is recommended to choose 3-hop expert
-            4. Given the specific reason for the selection, it is necessary to be based on the actual structural characteristics of the node.
-            return in json format directly:
-            {{
-                "reason": "your reason",
-                "expert": 0, 1, or 2, ..., up to {config.expert_num - 1},
-                "probability": 0.x
-            }}
-            """
-            print(f"Prompt for node {node_id}: {prompt}")
-            prompts.append(prompt)
+        graph2text_encoder = Graph2TextEncoder()
+        # 多进程生成prompts
+        expert_num = int(config.expert_num)
+        hop = int(config.hop)
+        # 只传递必要参数，避免wandb.config
+        args_list = [
+            (node_id, source_data.cpu(), {}, expert_num, hop)
+            for node_id in range(source_data.num_nodes)
+        ]
+        with multiprocessing.Pool(processes=min(multiprocessing.cpu_count(), 16)) as pool:
+            prompts = pool.map(build_prompt_for_node, args_list)
         # 保存 prompts
         with open(prompts_path, 'wb') as f:
             pickle.dump(prompts, f)
