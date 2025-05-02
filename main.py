@@ -125,8 +125,10 @@ def index2dense(edge_index, nnode=2708):
     return adj
 
 def encode(data, cache_name, mask=None):
-    # Ensure 'encoder' is accessible (defined later, might need refactoring or pass as arg if needed earlier)
-    encoded_output, experts_outputs, gate_loss, clean_logits = encoder(data.x, data.edge_index, cache_name)
+    # 保证 data.x 和 data.edge_index 在 device 上
+    x = data.x.to(device)
+    edge_index = data.edge_index.to(device)
+    encoded_output, experts_outputs, gate_loss, clean_logits = encoder(x, edge_index, cache_name)
     if mask is not None:
         encoded_output = encoded_output[mask]
         experts_outputs = experts_outputs[mask]
@@ -411,8 +413,8 @@ def get_max_hop_neighbors(edge_index, num_nodes, mask):
     return neighbor_mask
 
 # ========== LLM专家选择预处理 ==========
-expert_selections_path = f"log/{config.source}-{config.target}-{config.llm}-selections.json"
-prompts_path = f"log/{config.source}-{config.target}-{config.llm}-prompts.pkl"
+expert_selections_path = f"log/{config.source}-{config.llm}-selections.json"
+prompts_path = f"log/{config.source}-prompts.pkl"
 if os.path.exists(expert_selections_path):
     with open(expert_selections_path, 'r') as f:
         expert_selections = json.load(f)
@@ -431,17 +433,15 @@ else:
     else:
         prompts = []
         graph2text_encoder = Graph2TextEncoder()
-        # 多进程生成prompts
         expert_num = int(config.expert_num)
         hop = int(config.hop)
-        # 只传递必要参数，避免wandb.config
+        # 只在这里用 .cpu()，主流程 source_data 不变
         args_list = [
             (node_id, source_data.cpu(), {}, expert_num, hop)
             for node_id in range(source_data.num_nodes)
         ]
         with multiprocessing.Pool(processes=min(multiprocessing.cpu_count(), 16)) as pool:
             prompts = pool.map(build_prompt_for_node, args_list)
-        # 保存 prompts
         with open(prompts_path, 'wb') as f:
             pickle.dump(prompts, f)
         print(f"Prompts saved to {prompts_path}")
