@@ -50,6 +50,7 @@ parser.add_argument("--uncertainty_k", type=int, default=100)
 parser.add_argument("--gate_coef", type=float, default=1e-1)
 parser.add_argument("--select_weight", type=float, default=1)
 parser.add_argument("--semi_weight", type=float, default=1)
+parser.add_argument("--div_weight", type=float, default=5e-5)
 parser.add_argument("--llm_interval", type=int, default=20, help="Interval of epochs to call LLM for expert selection")
 parser.add_argument("--hop", type=int, default=5)
 # --- W&B specific arguments (optional, can be set in wandb.init or sweep config) ---
@@ -576,7 +577,7 @@ def train(epoch):
     epoch_weight = float(epoch) / epochs
     # epoch_weight = 0
 
-    loss = cls_loss + epoch_weight * (config.semi_weight * high_quality_semi_loss + config.select_weight * select_loss) #+ semi_loss
+    loss = cls_loss + epoch_weight * (config.semi_weight * high_quality_semi_loss + config.select_weight * select_loss) + config.div_weight * gate_loss#+ semi_loss
     # loss = gate_loss + epoch_weight * (config.semi_weight * high_quality_semi_loss) + config.select_weight * select_loss
     # loss = cls_loss + gate_loss + (config.semi_weight * high_quality_semi_loss)
 
@@ -584,7 +585,7 @@ def train(epoch):
     wandb.log({
         'epoch': epoch,
         'train/cls_loss': cls_loss.item(),
-        # 'train/gate_loss': gate_loss.item(),
+        'train/gate_loss': gate_loss.item(),
         'train/select_loss': select_loss.item(), # Handle non-tensor case
         # 'train/semi_loss': semi_loss.item(),
         'train/high_quality_semi_loss': high_quality_semi_loss.item(),
@@ -593,7 +594,7 @@ def train(epoch):
     # --- End W&B Logging ---
 
     # Print losses (optional, as they are logged to W&B)
-    print(f"Epoch {epoch} Losses: Cls={cls_loss.item():.4f}, Select={select_loss.item() if isinstance(select_loss, torch.Tensor) else select_loss:.4f}, HQ Semi={high_quality_semi_loss.item() if isinstance(high_quality_semi_loss, torch.Tensor) else high_quality_semi_loss:.4f}, Total={loss.item():.4f}")
+    print(f"Epoch {epoch} Losses: Cls={cls_loss.item():.4f}, div={gate_loss.item():.4f}, Select={select_loss.item() if isinstance(select_loss, torch.Tensor) else select_loss:.4f}, HQ Semi={high_quality_semi_loss.item() if isinstance(high_quality_semi_loss, torch.Tensor) else high_quality_semi_loss:.4f}, Total={loss.item():.4f}")
 
     optimizer.zero_grad()
     loss.backward()

@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributions.normal import Normal
 import numpy as np
 from torch_geometric.nn import GCNConv, SAGEConv
@@ -302,23 +303,90 @@ class MoE(nn.Module):
         edge_index_k = self.get_k_hop_edge_index(edge_index, num_nodes, hop)
         return expert(x, edge_index_k, edge_attr)
 
-    def forward(self, x, edge_index, edge_attr=None):
-        """Args:
-        x: tensor shape [batch_size, input_size]
-        edge_index: tensor shape [2, num_edges]
-        edge_attr: tensor shape [num_edges, edge_dim] or None
+    def diversity_loss(self, expert_outputs, gates, tau=0.2):
+        """优化后的多样性增强损失计算
+        
+        Args:
+            expert_outputs: [num_nodes, num_experts, d_feature] 每个专家对每个节点的编码
+            gates: [num_nodes, num_experts] 门控矩阵 
+            tau: float, 温度系数 τ
+            
         Returns:
-        y: a tensor with shape [batch_size, output_size].
-        extra_training_loss: a scalar.  This should be added into the overall
-        training loss of the model.  The backpropagation of this loss
-        encourages all experts to be approximately equally used across a batch.
+            loss: diversity-enhanced loss scalar
         """
+        num_nodes, num_experts, _ = expert_outputs.shape
+        total_loss = 0.0
+        
+        # 对每个专家并行计算loss
+        for k in range(num_experts):
+            # 获取当前专家的激活节点mask
+            mask = gates[:, k] > 0
+            if not mask.any():
+                continue
+                
+            # 获取专家k的所有激活节点表示 [n_k, d_feature]
+            h_k = expert_outputs[mask, k]
+            n_k = h_k.size(0)
+            
+            if n_k <= 1:  # 至少需要2个节点才能计算相似度
+                continue
+                
+            # 计算所有节点对的相似度矩阵 [n_k, n_k]
+            sim_matrix = torch.matmul(h_k, h_k.t()) / tau
+            
+            # 创建对角线mask
+            diag_mask = ~torch.eye(n_k, dtype=torch.bool, device=sim_matrix.device)
+            
+            # 计算分母(logsumexp)
+            denominator = torch.logsumexp(sim_matrix, dim=1)  # [n_k]
+            
+            # 计算正样本的相似度(排除自身)
+            pos_sim = sim_matrix[diag_mask].view(n_k, -1)  # [n_k, n_k-1]
+            
+            # 并行计算每个节点的loss
+            node_losses = -torch.mean(pos_sim / denominator.unsqueeze(1), dim=1)  # [n_k]
+            total_loss += node_losses.sum()
+
+        # 按照公式(10)归一化    
+        if total_loss == 0:
+            return torch.tensor(0.0, device=expert_outputs.device)
+        return total_loss / (num_experts * num_nodes)
+
+    # def forward(self, x, edge_index, edge_attr=None):
+    #     """Args:
+    #     x: tensor shape [batch_size, input_size]
+    #     edge_index: tensor shape [2, num_edges]
+    #     edge_attr: tensor shape [num_edges, edge_dim] or None
+    #     Returns:
+    #     y: a tensor with shape [batch_size, output_size].
+    #     extra_training_loss: a scalar.  This should be added into the overall
+    #     training loss of the model.  The backpropagation of this loss
+    #     encourages all experts to be approximately equally used across a batch.
+    #     """
+    #     gates, load, clean_logits = self.noisy_top_k_gating(x, edge_index, self.training)
+    #     # calculate importance loss
+    #     importance = gates.sum(0)
+    #     #
+    #     loss = self.cv_squared(importance) + self.cv_squared(load)
+    #     loss *= self.loss_coef
+    #     expert_outputs = []
+    #     num_nodes = x.size(0)
+    #     for i in range(self.num_experts):
+    #         expert = self.experts[i]
+    #         hop = self.num_hops[i]
+    #         edge_index_k = self.get_k_hop_edge_index(edge_index, num_nodes, hop)
+    #         expert_i_output = expert(x, edge_index_k, edge_attr)
+    #         expert_outputs.append(expert_i_output)
+    #     expert_outputs = torch.stack(expert_outputs, dim=1) # shape=[num_nodes, num_experts, d_feature]
+    #     # gates: shape=[num_nodes, num_experts]
+    #     y = gates.unsqueeze(dim=-1) * expert_outputs
+    #     y = y.sum(dim=1)
+    #     return y, expert_outputs, loss, clean_logits
+    
+    def forward(self, x, edge_index, edge_attr=None):
+        # ...existing code...
         gates, load, clean_logits = self.noisy_top_k_gating(x, edge_index, self.training)
-        # calculate importance loss
-        importance = gates.sum(0)
-        #
-        loss = self.cv_squared(importance) + self.cv_squared(load)
-        loss *= self.loss_coef
+        # calculate diversity-enhanced loss
         expert_outputs = []
         num_nodes = x.size(0)
         for i in range(self.num_experts):
@@ -329,6 +397,8 @@ class MoE(nn.Module):
             expert_outputs.append(expert_i_output)
         expert_outputs = torch.stack(expert_outputs, dim=1) # shape=[num_nodes, num_experts, d_feature]
         # gates: shape=[num_nodes, num_experts]
-        y = gates.unsqueeze(dim=-1) * expert_outputs
+        y = clean_logits.unsqueeze(dim=-1) * expert_outputs
         y = y.sum(dim=1)
+        # 多样性损失
+        loss = self.diversity_loss(expert_outputs, clean_logits)
         return y, expert_outputs, loss, clean_logits
