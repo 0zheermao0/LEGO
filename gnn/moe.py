@@ -142,7 +142,8 @@ class MoE(nn.Module):
         self.gate_gnn = nn.Sequential(
             PPMIConv(input_size, num_experts),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            # nn.BatchNorm1d(num_experts),
+            # nn.Dropout(0.05),
             # PPMIConv(input_size, num_experts),
             # nn.ReLU()
         )
