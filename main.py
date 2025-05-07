@@ -433,6 +433,7 @@ def get_max_hop_neighbors(edge_index, num_nodes, mask):
 
     return neighbor_mask
 
+expert_selections_local = {}
 def train(epoch):
     for model in models:
         model.train()
@@ -449,7 +450,6 @@ def train(epoch):
 
     # 动态生成 LLM expert selections
     uncertainty_node_indices = torch.where(uncertainty_mask)[0].tolist()
-    expert_selections_local = {}
     if uncertainty_node_indices and (epoch % config.llm_interval == 0):  # 添加epoch interval判断
         print(f"Epoch {epoch}: Calling LLM for expert selection...")
         for node_id in uncertainty_node_indices:
@@ -487,21 +487,21 @@ def train(epoch):
             except Exception as e:
                 print(f"Node {node_id}: Ollama error: {e}. Defaulting to random.")
                 expert_selections_local[node_id] = np.random.randint(0, config.expert_num)
-    elif uncertainty_node_indices:  # 不在interval时使用随机选择
-        for node_id in uncertainty_node_indices:
-            expert_selections_local[node_id] = np.random.randint(0, config.expert_num)
+    # elif uncertainty_node_indices:  # 不在interval时使用随机选择
+    #     for node_id in uncertainty_node_indices:
+    #         expert_selections_local[node_id] = np.random.randint(0, config.expert_num)
 
         # 计算select loss
-        num_experts = config.expert_num
-        llm_expert_dist = torch.zeros(len(uncertainty_node_indices), num_experts, device=device)
-        uncertainty_node_indices_tensor = torch.tensor(uncertainty_node_indices, device=device, dtype=torch.long)
-        moe_expert_dist = source_clean_logits[uncertainty_node_indices_tensor]
-        llm_expert_indices_list = [expert_selections_local.get(node_id_int, 0) for node_id_int in uncertainty_node_indices]
-        llm_expert_indices_tensor = torch.tensor(llm_expert_indices_list, device=device, dtype=torch.long)
-        llm_expert_dist = F.one_hot(llm_expert_indices_tensor, num_classes=num_experts).float()
-        select_loss = torch.nn.functional.cross_entropy(
-            moe_expert_dist, llm_expert_dist
-        )
+    num_experts = config.expert_num
+    llm_expert_dist = torch.zeros(len(uncertainty_node_indices), num_experts, device=device)
+    uncertainty_node_indices_tensor = torch.tensor(uncertainty_node_indices, device=device, dtype=torch.long)
+    moe_expert_dist = source_clean_logits[uncertainty_node_indices_tensor]
+    llm_expert_indices_list = [expert_selections_local.get(node_id_int, 0) for node_id_int in uncertainty_node_indices]
+    llm_expert_indices_tensor = torch.tensor(llm_expert_indices_list, device=device, dtype=torch.long)
+    llm_expert_dist = F.one_hot(llm_expert_indices_tensor, num_classes=num_experts).float()
+    select_loss = torch.nn.functional.cross_entropy(
+        moe_expert_dist, llm_expert_dist
+    )
 
     # Classifier loss:
     cls_loss = loss_func(source_logits[label_mask], source_data.y[label_mask])
