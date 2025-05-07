@@ -318,9 +318,9 @@ params = itertools.chain(*[model.parameters() for model in models])
 optimizer = torch.optim.Adam(params, lr=config.learning_rate, weight_decay=config.weight_decay)
 # optimizer_moe = torch.optim.Adam(encoder.gate_gnn.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
 # print 哪些模块的参数被更新
-for name, param in encoder.named_parameters():
-    if param.requires_grad:
-        print(name, param.data)
+# for name, param in encoder.named_parameters():
+#     if param.requires_grad:
+#         print(name, param.data)
 
 # optimizer = torch.optim.Adam(params, lr=config.learning_rate)
 

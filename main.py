@@ -213,17 +213,19 @@ def get_renode_weight(data, pseudo_label):
     rn_weight = torch.from_numpy(np.array(rn_weight)).type(torch.FloatTensor)
     return rn_weight
 
-def build_prompt_for_node(args):
-    node_id, source_data, config_dict, expert_num, hop, experts_outputs = args
-    node_mask = torch.zeros(source_data.num_nodes, dtype=torch.bool)
+def build_prompt_for_node(node_id, source_data, experts_outputs, cls_model, expert_num, hop=5):
+    """
+    为节点构建动态 prompt，包含当前时刻各个 expert 的预测信息
+    """
+    node_mask = torch.zeros(source_data.num_nodes, dtype=torch.bool, device=source_data.edge_index.device)
     node_mask[node_id] = True
 
     # 遍历指定跳数的所有邻居
     max_hop = hop
-    edge_index_np = source_data.edge_index.cpu().numpy()
+    edge_index = source_data.edge_index.cpu()
     adj = [[] for _ in range(source_data.num_nodes)]
-    for i in range(edge_index_np.shape[1]):
-        src, dst = edge_index_np[0, i], edge_index_np[1, i]
+    for i in range(edge_index.shape[1]):
+        src, dst = edge_index[0, i], edge_index[1, i]
         adj[src].append(dst)
         adj[dst].append(src)
 
@@ -240,43 +242,49 @@ def build_prompt_for_node(args):
     for n in visited:
         node_mask[n] = True
 
+    # 获取当前节点各个expert的预测信息
+    node_expert_outputs = experts_outputs[node_id]  # Shape: [num_experts, feature_dim]
+    expert_predictions = []
+    for expert_idx in range(expert_num):
+        expert_logits = cls_model(node_expert_outputs[expert_idx].unsqueeze(0))
+        expert_probs = F.softmax(expert_logits, dim=1)
+        predicted_class = torch.argmax(expert_probs).item()
+        confidence = expert_probs[0][predicted_class].item()
+        expert_predictions.append(f"Expert {expert_idx} ({expert_idx+1}-hop): predicted class {predicted_class} with confidence {confidence:.3f}")
+
+    graph2text_encoder = Graph2TextEncoder()
     graph_description = graph2text_encoder.encode(
         source_data.edge_index, mask=node_mask, num_nodes=source_data.num_nodes, style='natural'
     )
-    
-    expert_predictions = ""
-    if experts_outputs is not None and node_id < experts_outputs.shape[0]:
-        expert_predictions = "\nExpert Predictions:\n"
-        for i in range(expert_num):
-            expert_output = experts_outputs[node_id, i, :].to(device)
-            expert_logit = cls_model(expert_output.unsqueeze(0)).detach().cpu().numpy()
-            expert_pred = np.argmax(expert_logit, axis=1)[0]
-            expert_confidence = np.max(expert_logit, axis=1)[0]
-            expert_predictions += f"Expert {i} ({i+1}-hop): Predicted class {expert_pred} with confidence {expert_confidence:.2f}\n"
-    
+
     prompt = f"""
-    You are an expert on GNN experts selector, given node and its neighborhood: {graph_description}
-    and {config.expert_num} GNN experts: (0:1-hop, 1:2-hop, 2:3-hop, ...) {' '.join([f'{i}:{i+1}-hop' for i in range(config.expert_num)])}
-    - 1-hop: Use when direct neighbors provide sufficient classification signals.
-    - 2-hop: Use for indirect relationships.
-    - 3-hop: Use for long-range dependencies or hierarchical structures.
-    {expert_predictions}
-    give out your choice on expert directly for node {node_id}.
-    Please note:
-    1. If the structure around the node is simple and there are few neighbors, it is recommended to choose 1-hop expert
-    2. If the node has more 2-hop neighbors, it is recommended to choose 2-hop expert
-    3. If the node is in a complex community structure, it is recommended to choose 3-hop expert
-    4. Given the specific reason for the selection, it is necessary to be based on the actual structural characteristics of the node and the predictions of the experts.
-    return in json format directly:
+    You are an expert on GNN experts selector. For the following node and its neighborhood:
+    {graph_description}
+    
+    Current predictions from {expert_num} GNN experts:
+    {chr(10).join(expert_predictions)}
+    
+    Available experts are: {' '.join([f'{i}:{i+1}-hop' for i in range(expert_num)])}
+    - 1-hop: Use when direct neighbors provide sufficient classification signals
+    - 2-hop: Use for indirect relationships
+    - 3-hop: Use for long-range dependencies or hierarchical structures
+    
+    Based on both the graph structure and current expert predictions, choose the most suitable expert for node {node_id}.
+    
+    Consider:
+    1. If structure is simple and direct neighbors are informative, prefer 1-hop expert
+    2. If 2-hop neighbors provide better signals or current class distribution, choose 2-hop expert
+    3. If complex community structure or current predictions indicate long-range dependencies, use 3-hop expert
+    4. Consider both prediction confidence and structural characteristics
+    
+    Return in json format:
     {{
-        "reason": "your reason",
-        "expert": 0, 1, or 2, ..., up to {config.expert_num - 1},
+        "reason": "your reason considering both structure and predictions",
+        "expert": 0, 1, or 2, ..., up to {expert_num - 1},
         "probability": 0.x
     }}
     """
-    print(f"Prompt for node {node_id}: {prompt}")  # Debugging line to check the prompt
     return prompt
-
 
 loss_func = nn.CrossEntropyLoss().to(device)
 
@@ -291,7 +299,6 @@ cls_model = nn.Sequential(
     # Maybe add dropout here if needed, using config.drop_out?
     # nn.Dropout(p=config.drop_out), # Example
 ).to(device)
-graph2text_encoder = Graph2TextEncoder()
 
 # --- Watch Models with W&B (Optional, logs gradients and parameters) ---
 # wandb.watch(encoder, log_freq=100)
@@ -426,81 +433,65 @@ def get_max_hop_neighbors(edge_index, num_nodes, mask):
 
     return neighbor_mask
 
-# ========== LLM专家选择初始化 ==========
-expert_selections_path = f"log/{config.source}-{config.llm}-selections.json"
-if os.path.exists(expert_selections_path):
-    with open(expert_selections_path, 'r') as f:
-        expert_selections = json.load(f)
-    expert_selections = {int(k): v for k, v in expert_selections.items()}
-    print(f"Loaded expert selections from {expert_selections_path}, total: {len(expert_selections)}")
-else:
-    expert_selections = {}
-    print(f"No pre-existing expert selections found. Will generate dynamically during training.")
-# ========== END LLM专家选择初始化 ==========
-
 def train(epoch):
     for model in models:
         model.train()
-    # optimizer.zero_grad()
-
-    # Set rate for GradReverse (ensure this is the intended way to set it)
-    # GradReverse.rate = min((epoch + 1) / epochs, 0.05)
 
     encoded_source, experts_outputs, source_gate_loss, source_clean_logits = encode(source_data, config.source)
     source_logits = cls_model(encoded_source)
 
-    # Use config for uncertainty_k
     uncertainty_mask = calculate_expert_uncertainty(experts_outputs, source_data.num_classes, cls_model, config.uncertainty_k)
-
     max_hop_neighbors_mask = get_max_hop_neighbors(source_data.edge_index, source_data.num_nodes, uncertainty_mask)
     combined_mask = uncertainty_mask | max_hop_neighbors_mask
 
-    # Initialize losses to avoid potential unbound errors
     select_loss = torch.tensor(0.0, device=device)
     high_quality_semi_loss = torch.tensor(0.0, device=device)
-    # semi_loss = torch.tensor(0.0, device=device) # Initialize base semi_loss too
 
-    # 动态调用 LLM 获取专家选择
-    global expert_selections
-    expert_selections_local = expert_selections.copy()
-    if epoch % config.llm_interval == 0:
-        print(f"Epoch {epoch}: Dynamically calling LLM for expert selection...")
-        uncertainty_node_indices = torch.where(uncertainty_mask)[0].tolist()
-        for node_id in uncertainty_node_indices:
-            if node_id not in expert_selections_local:
-                args = (node_id, source_data.cpu(), {}, config.expert_num, config.hop, experts_outputs.cpu())
-                prompt = build_prompt_for_node(args)
-                try:
-                    response = ollama.generate(
-                        model=config.llm,
-                        prompt=prompt,
-                        format='json',
-                        options={'temperature': 0, 'num_ctx': 40960, 'num_predict': 4096}
-                    )
-                    json_output_str = response['response']
-                    try:
-                        parsed_json = json.loads(json_output_str)
-                        expert = parsed_json.get("expert")
-                        if isinstance(expert, int) and 0 <= expert < config.expert_num:
-                            expert_selections_local[node_id] = expert
-                        else:
-                            print(f"Warning: Invalid expert value {expert} for node {node_id}. Defaulting to random.")
-                            expert_selections_local[node_id] = np.random.randint(0, config.expert_num)
-                    except json.JSONDecodeError as e:
-                        print(f"Node {node_id}: JSONDecodeError: {e}. Response: '{json_output_str}'. Defaulting to random.")
-                        expert_selections_local[node_id] = np.random.randint(0, config.expert_num)
-                except Exception as e:
-                    print(f"Node {node_id}: Ollama error: {e}. Defaulting to random.")
-                    expert_selections_local[node_id] = np.random.randint(0, config.expert_num)
-        # 更新全局 expert_selections 以便保存
-        expert_selections = expert_selections_local
-        with open(expert_selections_path, 'w') as f:
-            json.dump(expert_selections, f)
-        print(f"Updated expert selections saved to {expert_selections_path}")
-
-    # 只要有uncertainty节点就计算select_loss
+    # 动态生成 LLM expert selections
     uncertainty_node_indices = torch.where(uncertainty_mask)[0].tolist()
-    if uncertainty_node_indices:
+    expert_selections_local = {}
+    if uncertainty_node_indices and (epoch % config.llm_interval == 0):  # 添加epoch interval判断
+        print(f"Epoch {epoch}: Calling LLM for expert selection...")
+        for node_id in uncertainty_node_indices:
+            try:
+                prompt = build_prompt_for_node(
+                    node_id, 
+                    source_data,
+                    experts_outputs,
+                    cls_model,
+                    config.expert_num,
+                    config.hop
+                )
+                response = ollama.generate(
+                    model=config.llm,
+                    prompt=prompt,
+                    format='json',
+                    options={
+                        'temperature': 0,
+                        'num_ctx': 40960,
+                        'num_predict': 4096
+                    }
+                )
+                json_output_str = response['response']
+                try:
+                    parsed_json = json.loads(json_output_str)
+                    expert = parsed_json.get("expert")
+                    if isinstance(expert, int) and 0 <= expert < config.expert_num:
+                        expert_selections_local[node_id] = expert
+                    else:
+                        print(f"Warning: Invalid expert value {expert} for node {node_id}. Defaulting to random.")
+                        expert_selections_local[node_id] = np.random.randint(0, config.expert_num)
+                except json.JSONDecodeError as e:
+                    print(f"Node {node_id}: JSONDecodeError: {e}. Response: '{json_output_str}'. Defaulting to random.")
+                    expert_selections_local[node_id] = np.random.randint(0, config.expert_num)
+            except Exception as e:
+                print(f"Node {node_id}: Ollama error: {e}. Defaulting to random.")
+                expert_selections_local[node_id] = np.random.randint(0, config.expert_num)
+    elif uncertainty_node_indices:  # 不在interval时使用随机选择
+        for node_id in uncertainty_node_indices:
+            expert_selections_local[node_id] = np.random.randint(0, config.expert_num)
+
+        # 计算select loss
         num_experts = config.expert_num
         llm_expert_dist = torch.zeros(len(uncertainty_node_indices), num_experts, device=device)
         uncertainty_node_indices_tensor = torch.tensor(uncertainty_node_indices, device=device, dtype=torch.long)
