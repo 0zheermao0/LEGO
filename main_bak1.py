@@ -476,6 +476,14 @@ else:
     print(f"Expert selections saved to {expert_selections_path}")
 # ========== END LLM专家选择预处理 ==========
 
+# --- Model Saving Setup ---
+model_save_dir = "models"
+os.makedirs(model_save_dir, exist_ok=True)
+# Define paths for the best models, incorporating key config parameters for uniqueness
+best_encoder_path = os.path.join(model_save_dir, f"{config.source}-{config.target}-seed{config.seed}-best_encoder.pt")
+best_cls_model_path = os.path.join(model_save_dir, f"{config.source}-{config.target}-seed{config.seed}-best_cls_model.pt")
+# --- End Model Saving Setup ---
+
 def train(epoch):
     for model in models:
         model.train()
@@ -639,6 +647,11 @@ for epoch in range(1, epochs + 1): # Run for `epochs` epochs (e.g., 1 to 200)
             best_micro_f1 = micro_f1
             best_epoch = epoch
             print(f"*** New best target accuracy at epoch {epoch}: {best_target_acc:.4f} ***")
+            # --- SAVE BEST MODEL WEIGHTS ---
+            print(f"Saving best model at epoch {epoch} to {best_encoder_path} and {best_cls_model_path}")
+            torch.save(encoder.state_dict(), best_encoder_path)
+            torch.save(cls_model.state_dict(), best_cls_model_path)
+            # --- End SAVE BEST MODEL WEIGHTS ---
 
 
     except Exception as e:

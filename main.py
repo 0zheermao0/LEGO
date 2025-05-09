@@ -52,7 +52,8 @@ parser.add_argument("--select_weight", type=float, default=1)
 parser.add_argument("--semi_weight", type=float, default=1)
 parser.add_argument("--div_weight", type=float, default=5e-5)
 parser.add_argument("--llm_interval", type=int, default=10, help="Interval of epochs to call LLM for expert selection")
-parser.add_argument("--hop", type=int, default=5)
+parser.add_argument("--hop", type=int, default=3)
+parser.add_argument("--node_limit", type=int, default=50)
 # --- W&B specific arguments (optional, can be set in wandb.init or sweep config) ---
 parser.add_argument("--wandb_project", type=str, default="GNN-Domain-Adaptation-Sweep")
 parser.add_argument("--wandb_entity", type=str, default=None, help="Your W&B username or team name") # Or set directly in wandb.init
@@ -82,7 +83,7 @@ id_str = "source: {}, target: {}, seed: {}, label_rate:{:.2f}, lr: {}, wd:{}, di
     .format(config.source, config.target, config.seed, config.label_rate, config.learning_rate, config.weight_decay,
             config.encoder_dim, config.drop_out, config.expert_num, config.llm, config.uncertainty_k, config.gate_coef)
 print(id_str)
-wandb.run.name = f"{config.source}-{config.target}-lr{config.learning_rate:.1e}-do{config.drop_out:.1e}-seed{config.seed}" # Example run name
+wandb.run.name = f"{config.source}-{config.target}-ucty{config.uncertainty_k}-itrvl{config.llm_interval}-seed{config.seed}" # Example run name
 
 random.seed(seed)
 np.random.seed(seed)
@@ -213,7 +214,7 @@ def get_renode_weight(data, pseudo_label):
     rn_weight = torch.from_numpy(np.array(rn_weight)).type(torch.FloatTensor)
     return rn_weight
 
-def build_prompt_for_node(node_id, source_data, experts_outputs, cls_model, expert_num, hop=5):
+def build_prompt_for_node(node_id, source_data, experts_outputs, cls_model, expert_num, hop=5, node_limit=100):
     """
     为节点构建动态 prompt，包含当前时刻各个 expert 的预测信息
     """
@@ -232,6 +233,8 @@ def build_prompt_for_node(node_id, source_data, experts_outputs, cls_model, expe
     visited = set([node_id])
     current_level = set([node_id])
     for hop in range(1, max_hop + 1):
+        if len(visited) >= node_limit:
+            break
         next_level = set()
         for current in current_level:
             for neighbor in adj[current]:
@@ -434,6 +437,13 @@ def get_max_hop_neighbors(edge_index, num_nodes, mask):
     return neighbor_mask
 
 expert_selections_local = {}
+# --- Model Saving Setup ---
+model_save_dir = "models"
+os.makedirs(model_save_dir, exist_ok=True)
+# Define paths for the best models, incorporating key config parameters for uniqueness
+best_encoder_path = os.path.join(model_save_dir, f"{config.source}-{config.target}-seed{config.seed}-best_encoder.pt")
+best_cls_model_path = os.path.join(model_save_dir, f"{config.source}-{config.target}-seed{config.seed}-best_cls_model.pt")
+# --- End Model Saving Setup ---
 def train(epoch):
     for model in models:
         model.train()
@@ -460,7 +470,8 @@ def train(epoch):
                     experts_outputs,
                     cls_model,
                     config.expert_num,
-                    config.hop
+                    config.hop,
+                    config.node_limit
                 )
                 response = ollama.generate(
                     model=config.llm,
@@ -627,6 +638,11 @@ for epoch in range(1, epochs + 1): # Run for `epochs` epochs (e.g., 1 to 200)
             best_micro_f1 = micro_f1
             best_epoch = epoch
             print(f"*** New best target accuracy at epoch {epoch}: {best_target_acc:.4f} ***")
+            # --- SAVE BEST MODEL WEIGHTS ---
+            print(f"Saving best model at epoch {epoch} to {best_encoder_path} and {best_cls_model_path}")
+            torch.save(encoder.state_dict(), best_encoder_path)
+            torch.save(cls_model.state_dict(), best_cls_model_path)
+            # --- End SAVE BEST MODEL WEIGHTS ---
 
 
     except Exception as e:
