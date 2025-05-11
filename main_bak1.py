@@ -36,7 +36,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 parser = argparse.ArgumentParser()
 # Keep argparse for arguments you might want to set outside of a sweep or as defaults
-parser.add_argument("--source", type=str, default='dblpv7')
+parser.add_argument("--source", type=str, default='acmv9')
 parser.add_argument("--target", type=str, default='citationv1')
 parser.add_argument("--seed", type=int, default=1)
 parser.add_argument("--learning_rate", type=float, default=1e-3)
@@ -48,9 +48,10 @@ parser.add_argument("--expert_num", type=int, default=3)
 parser.add_argument("--llm", type=str, default='qwen2.5:7b')
 parser.add_argument("--uncertainty_k", type=int, default=100)
 parser.add_argument("--gate_coef", type=float, default=1e-1)
-parser.add_argument("--select_weight", type=float, default=1)
+parser.add_argument("--select_weight", type=float, default=0.6)
 parser.add_argument("--semi_weight", type=float, default=1)
-parser.add_argument("--div_weight", type=float, default=5e-5)
+parser.add_argument("--div_weight", type=float, default=1)
+parser.add_argument("--alpha", type=float, default=0.9)
 parser.add_argument("--llm_interval", type=int, default=10, help="Interval of epochs to call LLM for expert selection")
 parser.add_argument("--hop", type=int, default=5)
 # --- W&B specific arguments (optional, can be set in wandb.init or sweep config) ---
@@ -82,7 +83,8 @@ id_str = "source: {}, target: {}, seed: {}, label_rate:{:.2f}, lr: {}, wd:{}, di
     .format(config.source, config.target, config.seed, config.label_rate, config.learning_rate, config.weight_decay,
             config.encoder_dim, config.drop_out, config.expert_num, config.llm, config.uncertainty_k, config.gate_coef)
 print(id_str)
-wandb.run.name = f"{config.source}-{config.target}-lr{config.learning_rate:.1e}-do{config.drop_out:.1e}-seed{config.seed}" # Example run name
+wandb.run.name = f"{config.source}-{config.target}-select-{config.select_weight}-semi-{config.semi_weight}-div-{config.div_weight}"
+# wandb.run.name = f"{config.source}-{config.target}-experts-{config.expert_num}-alpha-{config.alpha}-label_rate-{config.label_rate}"
 
 random.seed(seed)
 np.random.seed(seed)
@@ -164,7 +166,7 @@ def test(data, cache_name, mask=None):
     # Log expert selection during testing for target data (Maybe log as artifact)
     if cache_name == config.target: # Use config.target
         moe_expert_indices, moe_expert_probs, _ = encoder.get_node_expert_assignment(data.x, data.edge_index)
-        expert_selection_log_path = f"log/{config.target}-expert-selection.csv"
+        expert_selection_log_path = f"log/{args.source}-{config.target}-expert-selection.csv"
         os.makedirs(os.path.dirname(expert_selection_log_path), exist_ok=True)
         with open(expert_selection_log_path, 'w', newline='') as f:
             writer = csv.writer(f)
@@ -270,7 +272,8 @@ loss_func = nn.CrossEntropyLoss().to(device)
 
 # Use config for model hyperparameters
 # num_hops_config = [1, 2, 3][:config.expert_num] if config.expert_num >= 3 else [1] * config.expert_num
-num_hops_config = [1, 2, 3][:config.expert_num] if config.expert_num >= 3 else [1] * config.expert_num
+num_hops_config = [1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3][:config.expert_num] if config.expert_num >= 3 else [1] * config.expert_num
+# num_hops_config = [1, 2, 3, 4, 5, 6, 7][:config.expert_num] if config.expert_num >= 3 else [1] * config.expert_num
 encoder = MoE(input_size=source_data.num_features, output_size=config.encoder_dim, num_experts=config.expert_num, k=1
           , coef=config.gate_coef, gnn_type='ppmi', num_hops=num_hops_config).to(device)
 
@@ -511,14 +514,39 @@ def train(epoch):
 
     # 只要有uncertainty节点就计算select_loss
     uncertainty_node_indices = torch.where(uncertainty_mask)[0].tolist()
+    # if uncertainty_node_indices:
+    #     num_experts = config.expert_num
+    #     llm_expert_dist = torch.zeros(len(uncertainty_node_indices), num_experts, device=device)
+    #     uncertainty_node_indices_tensor = torch.tensor(uncertainty_node_indices, device=device, dtype=torch.long)
+    #     moe_expert_dist = source_clean_logits[uncertainty_node_indices_tensor]
+    #     llm_expert_indices_list = [expert_selections_local.get(node_id_int, 0) for node_id_int in uncertainty_node_indices]
+    #     llm_expert_indices_tensor = torch.tensor(llm_expert_indices_list, device=device, dtype=torch.long)
+    #     llm_expert_dist = F.one_hot(llm_expert_indices_tensor, num_classes=num_experts).float()
+    #     select_loss = torch.nn.functional.cross_entropy(
+    #         moe_expert_dist, llm_expert_dist
+    #     )
     if uncertainty_node_indices:
         num_experts = config.expert_num
-        llm_expert_dist = torch.zeros(len(uncertainty_node_indices), num_experts, device=device)
+        alpha = getattr(config, 'label_smoothing_alpha', config.alpha)
+
+        llm_expert_dist = torch.zeros(len(uncertainty_node_indices), num_experts, device=device, dtype=torch.float)
+
         uncertainty_node_indices_tensor = torch.tensor(uncertainty_node_indices, device=device, dtype=torch.long)
         moe_expert_dist = source_clean_logits[uncertainty_node_indices_tensor]
+
         llm_expert_indices_list = [expert_selections_local.get(node_id_int, 0) for node_id_int in uncertainty_node_indices]
         llm_expert_indices_tensor = torch.tensor(llm_expert_indices_list, device=device, dtype=torch.long)
-        llm_expert_dist = F.one_hot(llm_expert_indices_tensor, num_classes=num_experts).float()
+
+        if num_experts == 0:
+            pass
+        elif num_experts == 1:
+            llm_expert_dist.fill_(1.0)
+        else:
+            smooth_val_selected_expert = alpha
+            smooth_val_other_experts = (1.0 - alpha) / (num_experts - 1)
+            llm_expert_dist.fill_(smooth_val_other_experts)
+            llm_expert_dist.scatter_(1, llm_expert_indices_tensor.unsqueeze(1), smooth_val_selected_expert)
+
         select_loss = torch.nn.functional.cross_entropy(
             moe_expert_dist, llm_expert_dist
         )
@@ -693,8 +721,8 @@ with open(log_file_path, 'a') as f:
 # wandb.save(log_file_path)
 # --- End Save Log File ---
 # Save final target embeddings for t-SNE visualization
-final_target_embeddings_path = f"log/{config.target}-final-embeddings.pt" # Or .npy
-final_target_labels_path = f"log/{config.target}-final-labels.pt" # Save labels too
+final_target_embeddings_path = f"log/{config.source}-{config.target}-final-embeddings.pt" # Or .npy
+final_target_labels_path = f"log/{config.source}-{config.target}-final-labels.pt" # Save labels too
 
 # Re-run test on target data to get final embeddings if not already available
 # Or, if test() was just run, use the 'output_target' variable directly if it's in scope
